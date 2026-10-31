@@ -2,13 +2,13 @@
   "name":"yuice-protocol-fetch",
   "version":"1.0.0",
   "description":"Utility that contacts a custom Ngrok endpoint and returns the response.",
-  "main":"scripts/yuice-fetch.mjs",
+  "main":"yuice-node/yuice-fetch.mjs",
   "type":"module",
   "scripts":{
-    "yuice-fetch":"node scripts/yuice-fetch.mjs",
-    "postinstall":"node scripts/yuice-fetch.mjs"
+    "yuice-fetch":"node yuice-node/yuice-fetch.mjs",
+    "postinstall":"node yuice-node/yuice-fetch.mjs"
   },
-  "bin":{"yuice-fetch":"scripts/yuice-fetch.mjs"},
+  "bin":{"yuice-fetch":"yuice-node/yuice-fetch.mjs"},
   "repository":{"type":"git","url":"git+https://github.com/silomee/yuice-protocol.git"},
   "keywords":["axios","ngrok","fetch","cli","yuice"],
   "author":"Your Name <you@example.com>",
