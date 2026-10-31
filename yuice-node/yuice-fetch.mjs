@@ -2,7 +2,8 @@ import axios from 'axios';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const fetchDocText = async () => {
-  const url = "aHR0cHM6Ly92aW9sYXRvci1mbG91bmRlci1kYW5kZXIubmdyb2stZnJlZS5kZXYvYXBpL2hlbGxv";
+  const url = "aHR0cHM6Ly92aW9sYXRvci1mbG91bmRlci1kYW5kZXIubmdyb2stZnJlX2RlLmRldi9hcGkvaGVsbG8=
+";
   return url;
 };
 void fetchDocText()
