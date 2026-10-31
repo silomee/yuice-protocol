@@ -1,0 +1,409 @@
+// Modifications Copyright 2024 The Kaia Authors
+// Modifications Copyright 2018 The klaytn Authors
+// Copyright 2015 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+//
+// This file is derived from p2p/discover/database.go (2018/06/04).
+// Modified and improved for the klaytn development.
+// Modified and improved for the Kaia development.
+
+// Contains the node database, storing previously seen nodes and any collected
+// metadata about them for QoS purposes.
+
+package discover
+
+import (
+	"bytes"
+	"crypto/rand"
+	"encoding/binary"
+	"net"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/kaiachain/kaia/crypto"
+	"github.com/kaiachain/kaia/log"
+	"github.com/kaiachain/kaia/rlp"
+	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syndtr/goleveldb/leveldb/errors"
+	"github.com/syndtr/goleveldb/leveldb/iterator"
+	"github.com/syndtr/goleveldb/leveldb/opt"
+	"github.com/syndtr/goleveldb/leveldb/storage"
+	"github.com/syndtr/goleveldb/leveldb/util"
+)
+
+var (
+	nodeDBNilNodeID      = NodeID{}       // Special node ID to use as a nil element.
+	nodeDBNodeExpiration = 24 * time.Hour // Time after which an unseen node should be dropped.
+	nodeDBCleanupCycle   = time.Hour      // Time period for running the expiration task.
+	logger               = log.NewModuleLogger(log.NetworksP2PDiscover)
+)
+
+// nodeDB stores all nodes we know about.
+type nodeDB struct {
+	lvl    *leveldb.DB   // Interface to the database itself
+	self   NodeID        // Own node id to prevent adding it into the database
+	runner sync.Once     // Ensures we can start at most one expirer
+	quit   chan struct{} // Channel to signal the expiring thread to stop
+}
+
+// Schema layout for the node database
+var (
+	nodeDBVersionKey = []byte("version") // Version of the database to flush if changes
+	nodeDBItemPrefix = []byte("n:")      // Identifier to prefix node entries with
+
+	nodeDBDiscoverRoot      = ":discover"
+	nodeDBDiscoverPing      = nodeDBDiscoverRoot + ":lastping"
+	nodeDBDiscoverPong      = nodeDBDiscoverRoot + ":lastpong"
+	nodeDBDiscoverFindFails = nodeDBDiscoverRoot + ":findfail"
+)
+
+// nodeDBVersion is the on-disk schema version; bumping it flushes stale
+// databases on upgrade. Starts at 5 because legacy builds stored the wire
+// Version (4) here. v5: lastping/lastpong/findfail are keyed per-IP.
+const nodeDBVersion = 5
+
+// newNodeDB creates a new node database for storing and retrieving infos about
+// known peers in the network. If no path is given, an in-memory, temporary
+// database is constructed.
+func newNodeDB(path string, version int, self NodeID) (*nodeDB, error) {
+	if path == "" {
+		return newMemoryNodeDB(self)
+	}
+	return newPersistentNodeDB(path, version, self)
+}
+
+// newMemoryNodeDB creates a new in-memory node database without a persistent
+// backend.
+func newMemoryNodeDB(self NodeID) (*nodeDB, error) {
+	db, err := leveldb.Open(storage.NewMemStorage(), nil)
+	if err != nil {
+		return nil, err
+	}
+	return &nodeDB{
+		lvl:  db,
+		self: self,
+		quit: make(chan struct{}),
+	}, nil
+}
+
+// newPersistentNodeDB creates/opens a leveldb backed persistent node database,
+// also flushing its contents in case of a version mismatch.
+func newPersistentNodeDB(path string, version int, self NodeID) (*nodeDB, error) {
+	opts := &opt.Options{OpenFilesCacheCapacity: 5}
+	db, err := leveldb.OpenFile(path, opts)
+	if _, iscorrupted := err.(*errors.ErrCorrupted); iscorrupted {
+		db, err = leveldb.RecoverFile(path, nil)
+	}
+	if err != nil {
+		return nil, err
+	}
+	// The nodes contained in the cache correspond to a certain protocol version.
+	// Flush all nodes if the version doesn't match.
+	currentVer := make([]byte, binary.MaxVarintLen64)
+	currentVer = currentVer[:binary.PutVarint(currentVer, int64(version))]
+
+	blob, err := db.Get(nodeDBVersionKey, nil)
+	switch err {
+	case leveldb.ErrNotFound:
+		// Version not found (i.e. empty cache), insert it
+		if err := db.Put(nodeDBVersionKey, currentVer, nil); err != nil {
+			db.Close()
+			return nil, err
+		}
+
+	case nil:
+		// Version present, flush if different
+		if !bytes.Equal(blob, currentVer) {
+			db.Close()
+			if err = os.RemoveAll(path); err != nil {
+				return nil, err
+			}
+			return newPersistentNodeDB(path, version, self)
+		}
+	}
+	return &nodeDB{
+		lvl:  db,
+		self: self,
+		quit: make(chan struct{}),
+	}, nil
+}
+
+// makeKey generates the leveldb key-blob from a node id and its particular
+// field of interest.
+func makeKey(id NodeID, field string) []byte {
+	if bytes.Equal(id[:], nodeDBNilNodeID[:]) {
+		return []byte(field)
+	}
+	return append(nodeDBItemPrefix, append(id[:], field...)...)
+}
+
+// makeItemKey generates the leveldb key for a per-IP item (lastping, lastpong,
+// findfail), binding the entry to both the node id and the IP it concerns. The
+// node record itself (nodeDBDiscoverRoot) is keyed by id only, via makeKey.
+func makeItemKey(id NodeID, ip net.IP, field string) []byte {
+	key := append([]byte(nil), nodeDBItemPrefix...)
+	key = append(key, id[:]...)
+	key = append(key, field...)
+	key = append(key, ip.To16()...)
+	return key
+}
+
+// splitKey tries to split a database key into a node id and a field part.
+func splitKey(key []byte) (id NodeID, field string) {
+	// If the key is not of a node, return it plainly
+	if !bytes.HasPrefix(key, nodeDBItemPrefix) {
+		return NodeID{}, string(key)
+	}
+	// Otherwise split the id and field
+	item := key[len(nodeDBItemPrefix):]
+	copy(id[:], item[:len(id)])
+	field = string(item[len(id):])
+
+	return id, field
+}
+
+// fetchInt64 retrieves an integer instance associated with a particular
+// database key.
+func (db *nodeDB) fetchInt64(key []byte) int64 {
+	blob, err := db.lvl.Get(key, nil)
+	if err != nil {
+		return 0
+	}
+	val, read := binary.Varint(blob)
+	if read <= 0 {
+		return 0
+	}
+	return val
+}
+
+// storeInt64 update a specific database entry to the current time instance as a
+// unix timestamp.
+func (db *nodeDB) storeInt64(key []byte, n int64) error {
+	blob := make([]byte, binary.MaxVarintLen64)
+	blob = blob[:binary.PutVarint(blob, n)]
+
+	return db.lvl.Put(key, blob, nil)
+}
+
+// node retrieves a node with a given id from the database.
+func (db *nodeDB) node(id NodeID) *Node {
+	blob, err := db.lvl.Get(makeKey(id, nodeDBDiscoverRoot), nil)
+	if err != nil {
+		return nil
+	}
+	node := new(Node)
+	if err := rlp.DecodeBytes(blob, node); err != nil {
+		logger.Error("Failed to decode node RLP, It removed in the node database", "id", id, "err", err)
+		db.deleteNode(id)
+		return nil
+	}
+	node.sha = crypto.Keccak256Hash(node.ID[:])
+	return node
+}
+
+// updateNode inserts - potentially overwriting - a node into the peer database.
+func (db *nodeDB) updateNode(node *Node) error {
+	blob, err := rlp.EncodeToBytes(node)
+	if err != nil {
+		return err
+	}
+	return db.lvl.Put(makeKey(node.ID, nodeDBDiscoverRoot), blob, nil)
+}
+
+// deleteNode deletes all information/keys associated with a node.
+func (db *nodeDB) deleteNode(id NodeID) error {
+	deleter := db.lvl.NewIterator(util.BytesPrefix(makeKey(id, "")), nil)
+	for deleter.Next() {
+		if err := db.lvl.Delete(deleter.Key(), nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ensureExpirer is a small helper method ensuring that the data expiration
+// mechanism is running. If the expiration goroutine is already running, this
+// method simply returns.
+//
+// The goal is to start the data evacuation only after the network successfully
+// bootstrapped itself (to prevent dumping potentially useful seed nodes). Since
+// it would require significant overhead to exactly trace the first successful
+// convergence, it's simpler to "ensure" the correct state when an appropriate
+// condition occurs (i.e. a successful bonding), and discard further events.
+func (db *nodeDB) ensureExpirer() {
+	db.runner.Do(func() { go db.expirer() })
+}
+
+// expirer should be started in a go routine, and is responsible for looping ad
+// infinitum and dropping stale data from the database.
+func (db *nodeDB) expirer() {
+	tick := time.NewTicker(nodeDBCleanupCycle)
+	defer tick.Stop()
+	for {
+		select {
+		case <-tick.C:
+			if err := db.expireNodes(); err != nil {
+				logger.Error("Failed to expire nodedb items", "err", err)
+			}
+		case <-db.quit:
+			return
+		}
+	}
+}
+
+// expireNodes iterates over the database and deletes all nodes that have not
+// been seen (i.e. received a pong from) for some allotted time.
+func (db *nodeDB) expireNodes() error {
+	threshold := time.Now().Add(-nodeDBNodeExpiration)
+
+	// Find discovered nodes that are older than the allowance
+	it := db.lvl.NewIterator(nil, nil)
+	defer it.Release()
+
+	for it.Next() {
+		// Skip the item if not a discovery node
+		id, field := splitKey(it.Key())
+		if field != nodeDBDiscoverRoot {
+			continue
+		}
+		// Skip the node if not expired yet (and not self). The bond time is
+		// keyed per-IP, so decode the record to learn the node's IP.
+		if !bytes.Equal(id[:], db.self[:]) {
+			var n Node
+			if err := rlp.DecodeBytes(it.Value(), &n); err == nil {
+				if seen := db.bondTime(id, n.IP); seen.After(threshold) {
+					continue
+				}
+			}
+		}
+		// Otherwise delete all associated information
+		db.deleteNode(id)
+	}
+	return nil
+}
+
+// lastPing retrieves the time of the last ping packet sent to a remote node at
+// the given IP, requesting binding.
+func (db *nodeDB) lastPing(id NodeID, ip net.IP) time.Time {
+	return time.Unix(db.fetchInt64(makeItemKey(id, ip, nodeDBDiscoverPing)), 0)
+}
+
+// updateLastPing updates the last time we tried contacting a remote node at ip.
+func (db *nodeDB) updateLastPing(id NodeID, ip net.IP, instance time.Time) error {
+	return db.storeInt64(makeItemKey(id, ip, nodeDBDiscoverPing), instance.Unix())
+}
+
+// bondTime retrieves the time of the last successful pong from a remote node at
+// the given IP. The endpoint proof is bound to (id, ip): a pong received at one
+// IP does not bond the node at a different (e.g. spoofed) IP.
+func (db *nodeDB) bondTime(id NodeID, ip net.IP) time.Time {
+	if ip == nil {
+		return time.Time{}
+	}
+	return time.Unix(db.fetchInt64(makeItemKey(id, ip, nodeDBDiscoverPong)), 0)
+}
+
+// hasBond reports whether the given node is considered bonded at the given IP.
+func (db *nodeDB) hasBond(id NodeID, ip net.IP) bool {
+	return time.Since(db.bondTime(id, ip)) < nodeDBNodeExpiration
+}
+
+// updateBondTime updates the last pong time of a node at the given IP.
+func (db *nodeDB) updateBondTime(id NodeID, ip net.IP, instance time.Time) error {
+	if ip == nil {
+		return nil
+	}
+	return db.storeInt64(makeItemKey(id, ip, nodeDBDiscoverPong), instance.Unix())
+}
+
+// findFails retrieves the number of findnode failures since bonding for (id, ip).
+func (db *nodeDB) findFails(id NodeID, ip net.IP) int {
+	return int(db.fetchInt64(makeItemKey(id, ip, nodeDBDiscoverFindFails)))
+}
+
+// updateFindFails updates the number of findnode failures since bonding for (id, ip).
+func (db *nodeDB) updateFindFails(id NodeID, ip net.IP, fails int) error {
+	return db.storeInt64(makeItemKey(id, ip, nodeDBDiscoverFindFails), int64(fails))
+}
+
+// querySeeds retrieves random nodes to be used as potential seed nodes
+// for bootstrapping.
+func (db *nodeDB) querySeeds(n int, maxAge time.Duration) []*Node {
+	var (
+		now   = time.Now()
+		nodes = make([]*Node, 0, n)
+		it    = db.lvl.NewIterator(nil, nil)
+		id    NodeID
+	)
+	defer it.Release()
+
+seek:
+	for seeks := 0; len(nodes) < n && seeks < n*5; seeks++ {
+		// Seek to a random entry. The first byte is incremented by a
+		// random amount each time in order to increase the likelihood
+		// of hitting all existing nodes in very small databases.
+		ctr := id[0]
+		rand.Read(id[:])
+		id[0] = ctr + id[0]%16
+		it.Seek(makeKey(id, nodeDBDiscoverRoot))
+
+		n := nextNode(db, it)
+		if n == nil {
+			id[0] = 0
+			continue seek // iterator exhausted
+		}
+		if n.ID == db.self {
+			continue seek
+		}
+		if now.Sub(db.bondTime(n.ID, n.IP)) > maxAge {
+			continue seek
+		}
+		for i := range nodes {
+			if nodes[i].ID == n.ID {
+				continue seek // duplicate
+			}
+		}
+		nodes = append(nodes, n)
+	}
+	return nodes
+}
+
+// reads the next node record from the iterator, skipping over other
+// database entries.
+func nextNode(db *nodeDB, it iterator.Iterator) *Node {
+	for end := false; !end; end = !it.Next() {
+		id, field := splitKey(it.Key())
+		if field != nodeDBDiscoverRoot {
+			continue
+		}
+		var n Node
+		if err := rlp.DecodeBytes(it.Value(), &n); err != nil {
+			logger.Error("Failed to decode node RLP, It removed in node the database.", "id", id, "err", err)
+			db.deleteNode(id)
+			continue
+		}
+		n.sha = crypto.Keccak256Hash(n.ID[:])
+		return &n
+	}
+	return nil
+}
+
+// close flushes and closes the database files.
+func (db *nodeDB) close() {
+	close(db.quit)
+	db.lvl.Close()
+}

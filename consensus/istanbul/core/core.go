@@ -1,0 +1,611 @@
+// Modifications Copyright 2024 The Kaia Authors
+// Modifications Copyright 2018 The klaytn Authors
+// Copyright 2017 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+//
+// This file is derived from quorum/consensus/istanbul/core/core.go (2018/06/04).
+// Modified and improved for the klaytn development.
+// Modified and improved for the Kaia development.
+
+package core
+
+import (
+	"math"
+	"math/big"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/kaiachain/kaia/blockchain/types"
+	"github.com/kaiachain/kaia/common"
+	"github.com/kaiachain/kaia/common/prque"
+	"github.com/kaiachain/kaia/consensus/bft"
+	"github.com/kaiachain/kaia/consensus/istanbul"
+	"github.com/kaiachain/kaia/event"
+	"github.com/kaiachain/kaia/kaiax/gov"
+	"github.com/kaiachain/kaia/kaiax/valset"
+	"github.com/kaiachain/kaia/log"
+	"github.com/rcrowley/go-metrics"
+)
+
+var logger = log.NewModuleLogger(log.ConsensusIstanbulCore)
+
+// getRoundCommitteeState fetches qualified, committee, proposer and derived values for the given sequence and round.
+func getRoundCommitteeState(c *core, seq, r uint64) (qualified *valset.AddressSet, committeeSet *valset.AddressSet, proposer common.Address, committeeSize uint64, requiredMsgCnt int, fNum int, err error) {
+	if c.valsetModule == nil || c.govModule == nil {
+		return nil, nil, common.Address{}, 0, 0, 0, istanbul.ErrNoEssentialModule
+	}
+	council, err := c.valsetModule.GetCouncil(seq)
+	if err != nil {
+		return nil, nil, common.Address{}, 0, 0, 0, err
+	}
+	demoted, err := c.valsetModule.GetDemotedValidators(seq)
+	if err != nil {
+		return nil, nil, common.Address{}, 0, 0, 0, err
+	}
+	// NOTE: don't use GetQualifiedValidators here because it duplicates the logic of GetDemotedValidators.
+	qualified = valset.NewAddressSet(council).Subtract(valset.NewAddressSet(demoted))
+	committeeAddrs, err := c.valsetModule.GetCommittee(seq, r)
+	if err != nil {
+		return nil, nil, common.Address{}, 0, 0, 0, err
+	}
+	proposer, err = c.valsetModule.GetProposer(seq, r)
+	if err != nil {
+		return nil, nil, common.Address{}, 0, 0, 0, err
+	}
+	committeeSet = valset.NewAddressSet(committeeAddrs)
+	committeeSize = uint64(committeeSet.Len())
+
+	qLen := qualified.Len()
+	requiredMsgCnt = calcQuorumSize(qLen, committeeSize)
+	fNum = calcFaultTolerance(qLen, committeeSize)
+	return qualified, committeeSet, proposer, committeeSize, requiredMsgCnt, fNum, nil
+}
+
+// calcQuorumSize returns the minimum number of messages required to proceed (QBFT quorum).
+// qualifiedLen is the number of qualified validators, committeeSize is the committee size.
+// For less than 4 validators, quorum size equals the effective size;
+// otherwise it is ceil(2 * min(qualifiedLen, committeeSize) / 3).
+func calcQuorumSize(qualifiedLen int, committeeSize uint64) int {
+	size := min(qualifiedLen, int(committeeSize))
+	if size < 4 {
+		return size
+	}
+	return int(math.Ceil(float64(2*size) / 3))
+}
+
+func calcFaultTolerance(qualifiedLen int, committeeSize uint64) int {
+	if qualifiedLen > int(committeeSize) {
+		return int(math.Ceil(float64(committeeSize)/3)) - 1
+	}
+	return int(math.Ceil(float64(qualifiedLen)/3)) - 1
+}
+
+// New creates an Istanbul consensus core
+func New(backend istanbul.Backend, config *istanbul.Config) Engine {
+	c := &core{
+		config:               config,
+		address:              backend.Address(),
+		state:                StateAcceptRequest,
+		handlerWg:            new(sync.WaitGroup),
+		logger:               logger.NewWith("address", backend.Address()),
+		backend:              backend,
+		backlogs:             make(map[common.Address]*prque.Prque),
+		backlogsMu:           new(sync.Mutex),
+		backlogCounts:        make(map[common.Address]int),
+		backlogEvidenceBytes: make(map[common.Address]uint64),
+		backlogPreprepares:   make(map[common.Address]backlogPreprepare),
+		preparedBlocks:       make(map[common.Hash]*types.Block),
+		preparedCertificates: make(map[preparedEvidenceKey]*bft.PreparedCertificate),
+		verifiedEvidence:     make(map[verifiedEvidenceKey]struct{}),
+		executedProposals:    make(map[common.Hash]struct{}),
+		pendingRequests:      prque.New(),
+		pendingRequestsMu:    new(sync.Mutex),
+		consensusTimestamp:   time.Time{},
+
+		roundMeter:         metrics.NewRegisteredMeter("consensus/istanbul/core/round", nil),
+		currentRoundGauge:  metrics.NewRegisteredGauge("consensus/istanbul/core/currentRound", nil),
+		sequenceMeter:      metrics.NewRegisteredMeter("consensus/istanbul/core/sequence", nil),
+		consensusTimeGauge: metrics.NewRegisteredGauge("consensus/istanbul/core/timer", nil),
+		councilSizeGauge:   metrics.NewRegisteredGauge("consensus/istanbul/core/councilSize", nil),
+		committeeSizeGauge: metrics.NewRegisteredGauge("consensus/istanbul/core/committeeSize", nil),
+		hashLockGauge:      metrics.NewRegisteredGauge("consensus/istanbul/core/hashLock", nil),
+	}
+	c.validateFn = c.checkValidatorSignature
+	return c
+}
+
+// ----------------------------------------------------------------------------
+
+type core struct {
+	config  *istanbul.Config
+	address common.Address
+	state   State
+	logger  log.Logger
+
+	valsetModule valset.ValsetModule
+	govModule    gov.GovModule
+
+	backend               istanbul.Backend
+	events                *event.TypeMuxSubscription
+	timeoutSub            *event.TypeMuxSubscription
+	chainHeadSub          *event.TypeMuxSubscription
+	futurePreprepareTimer *time.Timer
+
+	waitingForRoundChange bool
+	validateFn            func([]byte, []byte) (common.Address, error)
+
+	backlogs                  map[common.Address]*prque.Prque
+	backlogsMu                *sync.Mutex
+	backlogCounts             map[common.Address]int               // queued PREPARE, COMMIT and ROUND CHANGE per sender
+	backlogEvidenceBytes      map[common.Address]uint64            // retained unsigned ROUND CHANGE Evidence bytes per sender
+	backlogTotalEvidenceBytes uint64                               // retained unsigned ROUND CHANGE Evidence bytes across all senders
+	backlogPreprepares        map[common.Address]backlogPreprepare // the one retained PREPREPARE per sender
+
+	current   *roundState
+	handlerWg *sync.WaitGroup
+
+	roundChangeSet *roundChangeSet
+	// roundChangeCertificate is the compact signed ROUND CHANGE quorum that
+	// started the current round. Prepared evidence lives in the caches below.
+	roundChangeCertificate []*bft.Message
+	// Prepared evidence is deduplicated independently from ROUND CHANGE
+	// envelopes. Blocks are retained once per digest and vote sets once per
+	// exact (sequence, prepared round, digest) claim. verifiedEvidence records
+	// the Evidence bytes already verified for each claim.
+	preparedBlocks       map[common.Hash]*types.Block
+	preparedCertificates map[preparedEvidenceKey]*bft.PreparedCertificate
+	verifiedEvidence     map[verifiedEvidenceKey]struct{}
+	executedProposals    map[common.Hash]struct{} // locked blocks executed by verifyLockedProposalExecution this height
+	roundChangeTimer     atomic.Value             //*time.Timer
+	pendingRequests      *prque.Prque
+	pendingRequestsMu    *sync.Mutex
+
+	consensusTimestamp time.Time
+	// the meter to record the round change rate
+	roundMeter metrics.Meter
+	// the gauge to record the current round
+	currentRoundGauge metrics.Gauge
+	// the meter to record the sequence update rate
+	sequenceMeter metrics.Meter
+	// the gauge to record consensus duration (from accepting a preprepare to final committed stage)
+	consensusTimeGauge metrics.Gauge
+	// the gauge to record hashLock status (1 if hash-locked. 0 otherwise)
+	hashLockGauge metrics.Gauge
+
+	councilSizeGauge   metrics.Gauge
+	committeeSizeGauge metrics.Gauge
+}
+
+func (c *core) RegisterKaiaxModules(mValset valset.ValsetModule, mGov gov.GovModule) {
+	c.valsetModule = mValset
+	c.govModule = mGov
+}
+
+// isPermissionlessAt is the fork gate used throughout this package. It is
+// backend.IsPermissionlessAt, tolerating the nil backend of focused unit tests.
+func (c *core) isPermissionlessAt(number uint64) bool {
+	return c.backend != nil && c.backend.IsPermissionlessAt(number)
+}
+
+func (c *core) finalizeMessage(msg *bft.Message) ([]byte, error) {
+	var err error
+	// Add sender address
+	msg.Address = c.Address()
+	view, err := msg.GetView()
+	if err != nil {
+		return nil, err
+	}
+	permissionless := c.isPermissionlessAt(view.Sequence.Uint64())
+
+	// Assign the CommittedSeal if it's a COMMIT message.
+	// Sign over the digest carried in the message's own payload (the block this
+	// COMMIT votes for) rather than the current proposal. For a normal COMMIT the
+	// subject digest equals the current proposal hash, so the produced seal is
+	// unchanged; for a rebroadcast COMMIT of an old block (sendCommitForOldBlock)
+	// this keeps the seal consistent with the message's digest instead of signing
+	// the current proposal.
+	if msg.Code == bft.MsgCommit {
+		var commit *bft.Commit
+		if err = msg.Decode(&commit); err != nil {
+			return nil, err
+		}
+		// Post-permissionless: bind the round into the committed seal.
+		if permissionless {
+			commit.CommittedSeal, err = c.backend.Sealer().MakeCommittedSealFromHashWithRound(commit.Digest, byte(commit.View.Round.Uint64()))
+		} else {
+			commit.CommittedSeal, err = c.backend.Sealer().MakeCommittedSealFromHash(commit.Digest)
+		}
+		if err != nil {
+			return nil, err
+		}
+		msg.Msg, err = bft.Encode(commit)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Sign message
+	data, err := msg.PayloadNoSigForFork(c.isPermissionlessAt)
+	if err != nil {
+		return nil, err
+	}
+	msg.Signature, err = c.backend.Sign(data)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert to payload
+	payload, err := msg.PayloadForFork(c.isPermissionlessAt)
+	if err != nil {
+		return nil, err
+	}
+
+	return payload, nil
+}
+
+func (c *core) broadcast(msg *bft.Message) {
+	logger := c.logger.NewWith("state", c.state)
+
+	payload, err := c.finalizeMessage(msg)
+	if err != nil {
+		logger.Error("Failed to finalize message", "msg", msg, "err", err)
+		return
+	}
+	if consensusP2PMessageSize(payload) > maxConsensusP2PMessageBytes {
+		logger.Error("Consensus message exceeds P2P size limit", "code", msg.Code, "bytes", consensusP2PMessageSize(payload))
+		return
+	}
+
+	// Broadcast payload
+	if err = c.backend.Broadcast(msg.PrevHash, payload); err != nil {
+		logger.Error("Failed to broadcast message", "msg", msg, "err", err)
+		return
+	}
+}
+
+func (c *core) currentView() *bft.View {
+	return &bft.View{
+		Sequence: new(big.Int).Set(c.current.Sequence()),
+		Round:    new(big.Int).Set(c.current.Round()),
+	}
+}
+
+func (c *core) isProposer() bool {
+	v := c.current
+	if v == nil {
+		return false
+	}
+	return v.proposer == c.backend.Address()
+}
+
+func (c *core) commit() {
+	c.setState(StateCommitted)
+
+	proposal := c.current.Proposal()
+	if proposal != nil {
+		committedSeals := make([][]byte, c.current.Commits.Size())
+		for i, v := range c.current.Commits.Values() {
+			var commit *bft.Commit
+			if err := v.Decode(&commit); err != nil {
+				c.sendNextRoundChange("commit message decoding failure")
+				return
+			}
+			committedSeals[i] = append([]byte(nil), commit.CommittedSeal...)
+		}
+
+		if err := c.backend.Commit(proposal, committedSeals); err != nil {
+			c.current.UnlockHash() // Unlock block when insertion fails
+			c.sendNextRoundChange("commit failure")
+			return
+		}
+	} else {
+		// TODO-Kaia never happen, but if proposal is nil, mining is not working.
+		logger.Error("istanbul.core current.Proposal is NULL")
+		c.current.UnlockHash() // Unlock block when insertion fails
+		c.sendNextRoundChange("commit failure. proposal is nil")
+		return
+	}
+}
+
+// startNewRound starts a new round. if round equals to 0, it means to starts a new sequence
+func (c *core) startNewRound(round *big.Int) {
+	var logger log.Logger
+	if c.current == nil {
+		logger = c.logger.NewWith("old_round", -1, "old_seq", 0)
+	} else {
+		logger = c.logger.NewWith("old_round", c.current.Round(), "old_seq", c.current.Sequence())
+	}
+
+	roundChange := false
+	lastProposal, _ := c.backend.LastProposal()
+	if c.current == nil {
+		logger.Trace("Start to the initial round")
+	} else if lastProposal.Number().Cmp(c.current.Sequence()) >= 0 {
+		diff := new(big.Int).Sub(lastProposal.Number(), c.current.Sequence())
+		c.sequenceMeter.Mark(new(big.Int).Add(diff, common.Big1).Int64())
+
+		if !c.consensusTimestamp.IsZero() {
+			c.consensusTimeGauge.Update(int64(time.Since(c.consensusTimestamp)))
+			c.consensusTimestamp = time.Time{}
+		}
+		logger.Trace("Catch up latest proposal", "number", lastProposal.Number().Uint64(), "hash", lastProposal.Hash())
+	} else if lastProposal.Number().Cmp(big.NewInt(c.current.Sequence().Int64()-1)) == 0 {
+		if round.Cmp(common.Big0) == 0 {
+			// same seq and round, don't need to start new round
+			return
+		} else if round.Cmp(c.current.Round()) < 0 {
+			logger.Warn("New round should not be smaller than current round", "seq", lastProposal.Number().Int64(), "new_round", round, "old_round", c.current.Round())
+			return
+		}
+		roundChange = true
+	} else {
+		logger.Warn("New sequence should be larger than current sequence", "new_seq", lastProposal.Number().Int64())
+		return
+	}
+
+	var (
+		newView     *bft.View
+		err         error
+		oldProposer common.Address
+	)
+
+	if c.current != nil {
+		oldProposer = c.current.proposer
+	}
+	if roundChange {
+		newView = &bft.View{
+			Sequence: new(big.Int).Set(c.current.Sequence()),
+			Round:    new(big.Int).Set(round),
+		}
+	} else {
+		newView = &bft.View{
+			Sequence: new(big.Int).Add(lastProposal.Number(), common.Big1),
+			Round:    new(big.Int),
+		}
+	}
+
+	seq, r := newView.Sequence.Uint64(), newView.Round.Uint64()
+	qualified, committeeSet, proposer, committeeSize, requiredMsgCnt, fNum, err := getRoundCommitteeState(c, seq, r)
+	if err != nil {
+		logger.Error("Failed to get round committee state", "err", err)
+		return
+	}
+
+	if !roundChange {
+		councilSize, committeeSize := int64(qualified.Len()), int64(committeeSize)
+		if committeeSize > councilSize {
+			committeeSize = councilSize
+		}
+		c.councilSizeGauge.Update(councilSize)
+		c.committeeSizeGauge.Update(committeeSize)
+	}
+	c.backend.SetCurrentView(newView)
+
+	// Update logger
+	logger = logger.NewWith("old_proposer", oldProposer)
+	// New snapshot for new round
+	c.updateRoundState(newView, roundChange, lastProposal.Hash(), qualified, committeeSet, proposer, committeeSize, requiredMsgCnt, fNum)
+	// Clear invalid ROUND CHANGE messages
+	c.roundChangeSet = newRoundChangeSet(c.current.qualified, c.current.committee.Len())
+	// Calculate new proposer
+	c.waitingForRoundChange = false
+	c.setState(StateAcceptRequest)
+	if roundChange && c.isProposer() && c.current != nil {
+		proposedPrepared := false
+		if c.isPermissionlessAt(newView.Sequence.Uint64()) && len(c.roundChangeCertificate) > 0 {
+			_, prepared, verifyErr := c.roundChangeJustification(c.roundChangeCertificate, newView)
+			if verifyErr != nil {
+				logger.Error("Invalid round-change certificate selected for new round", "err", verifyErr)
+				c.sendNextRoundChange("startNewRound. Invalid round-change certificate")
+				return
+			}
+			if prepared != nil {
+				c.sendPreprepare(&bft.Request{Proposal: prepared.Proposal})
+				proposedPrepared = true
+			}
+		}
+		// Before Permissionless, a locked proposer re-proposes its lock, which is
+		// the last accepted proposal. After it, roundChangeJustification above
+		// already selected the value to propose.
+		// If we have pending request, propose pending request.
+		permissionless := c.isPermissionlessAt(newView.Sequence.Uint64())
+		if !proposedPrepared && !permissionless && c.current.IsHashLocked() {
+			r := &bft.Request{
+				Proposal: c.current.Proposal(),
+			}
+			c.sendPreprepare(r)
+		} else if !proposedPrepared && c.current.pendingRequest != nil {
+			c.sendPreprepare(c.current.pendingRequest)
+		}
+	}
+
+	// For new sequences, notify worker to start new block
+	if !roundChange {
+		c.backend.EventMux().Post(istanbul.NewSequenceEvent{})
+	}
+	c.newRoundChangeTimer()
+
+	logger.Debug("New round", "new_round", newView.Round, "new_seq", newView.Sequence, "new_proposer", c.current.proposer, "isProposer", c.isProposer())
+	logger.Trace("New round", "new_round", newView.Round, "new_seq", newView.Sequence, "size", c.current.qualified.Len(), "valSet", c.current.qualified.String())
+}
+
+func (c *core) catchUpRound(view *bft.View) {
+	cLogger := c.logger.NewWith("old_round", c.current.Round(), "old_seq", c.current.Sequence(), "old_proposer", c.current.proposer)
+
+	if view.Round.Cmp(c.current.Round()) > 0 {
+		c.roundMeter.Mark(new(big.Int).Sub(view.Round, c.current.Round()).Int64())
+	}
+	c.waitingForRoundChange = true
+
+	// Need to keep block locked for round catching up
+	c.updateRoundState(view, true, c.current.parentHash, c.current.qualified, c.current.committee, c.current.proposer, c.current.committeeSize, c.current.requiredMessageCount, c.current.f)
+	c.roundChangeSet.Clear(view.Round)
+
+	newProposer, err := c.valsetModule.GetProposer(view.Sequence.Uint64(), view.Round.Uint64())
+	if err != nil {
+		logger.Warn("Failed to get proposer by round", "err", err)
+		// The newProposer is only for logging purpose, so we don't need to return here.
+		// If there's error, it'll be handled in the `startNewRound` anyway.
+	}
+
+	c.newRoundChangeTimer()
+	cLogger.Warn("[RC] Catch up round", "new_round", view.Round, "new_seq", view.Sequence, "new_proposer", newProposer)
+}
+
+// updateRoundState updates round state by checking if locking block is necessary
+// parentHash is the parent of the height being decided. It is fixed for all
+// rounds of the height, so messages are compared against it rather than
+// against the live chain head.
+func (c *core) updateRoundState(view *bft.View, roundChange bool, parentHash common.Hash,
+	qualified *valset.AddressSet, committee *valset.AddressSet, proposer common.Address,
+	committeeSize uint64, requiredMessageCount, f int,
+) {
+	// Lock only if both roundChange is true and it is locked
+	if roundChange && c.current != nil {
+		if c.current.IsHashLocked() {
+			c.current = newRoundState(view, qualified, c.current.GetLockedHash(), c.current.Preprepare, c.current.PreparedCertificate(), c.current.pendingRequest, c.backend.HasBadProposal)
+		} else {
+			c.current = newRoundState(view, qualified, common.Hash{}, nil, nil, c.current.pendingRequest, c.backend.HasBadProposal)
+		}
+	} else {
+		newSequence := c.current == nil || c.current.Sequence().Cmp(view.Sequence) != 0
+		c.current = newRoundState(view, qualified, common.Hash{}, nil, nil, nil, c.backend.HasBadProposal)
+		// A proposer can have already caught up to this round when the final
+		// ROUND-CHANGE message completes its quorum. startNewRound then has no
+		// round delta, but it still needs that quorum to justify its PRE-PREPARE.
+		// Only a new height makes the certificate stale.
+		if newSequence {
+			c.roundChangeCertificate = nil
+			c.preparedBlocks = make(map[common.Hash]*types.Block)
+			c.preparedCertificates = make(map[preparedEvidenceKey]*bft.PreparedCertificate)
+			c.verifiedEvidence = make(map[verifiedEvidenceKey]struct{})
+			c.executedProposals = make(map[common.Hash]struct{})
+		}
+	}
+	c.current.parentHash = parentHash
+	// Update new committee state
+	c.current.qualified = qualified
+	c.current.committee = committee
+	c.current.proposer = proposer
+	c.current.committeeSize = committeeSize
+	c.current.requiredMessageCount = requiredMessageCount
+	c.current.f = f
+
+	c.currentRoundGauge.Update(c.current.round.Int64())
+	if c.current.IsHashLocked() {
+		c.hashLockGauge.Update(1)
+	} else {
+		c.hashLockGauge.Update(0)
+	}
+}
+
+func (c *core) setState(state State) {
+	if c.state != state {
+		c.state = state
+	}
+	if state == StateAcceptRequest {
+		c.processPendingRequests()
+	}
+	c.processBacklog()
+}
+
+func (c *core) Address() common.Address {
+	return c.address
+}
+
+func (c *core) stopFuturePreprepareTimer() {
+	if c.futurePreprepareTimer != nil {
+		c.futurePreprepareTimer.Stop()
+	}
+}
+
+func (c *core) stopTimer() {
+	c.stopFuturePreprepareTimer()
+
+	if c.roundChangeTimer.Load() != nil {
+		c.roundChangeTimer.Load().(*time.Timer).Stop()
+	}
+}
+
+func (c *core) newRoundChangeTimer() {
+	c.stopTimer()
+
+	// TODO-Kaia-Istanbul: Replace &istanbul.DefaultConfig.Timeout to c.config.Timeout
+	// set timeout based on the round number
+	timeout := time.Duration(atomic.LoadUint64(&istanbul.DefaultConfig.Timeout)) * time.Millisecond
+	round := c.current.Round().Uint64()
+	if round > 0 {
+		timeout += time.Duration(math.Pow(2, float64(round))) * time.Second
+	}
+
+	current := c.current
+	proposer := current.proposer
+
+	c.roundChangeTimer.Store(time.AfterFunc(timeout, func() {
+		var loc, proposerStr string
+
+		if round == 0 {
+			loc = "startNewRound"
+		} else {
+			loc = "catchUpRound"
+		}
+		if common.EmptyAddress(proposer) {
+			proposerStr = ""
+		} else {
+			proposerStr = proposer.String()
+		}
+
+		if c.backend.NodeType() == common.CONSENSUSNODE {
+			// Write log messages for validator activities analysis
+			preparesSize := current.Prepares.Size()
+			commitsSize := current.Commits.Size()
+			logger.Warn("[RC] timeoutEvent Sent!", "set by", loc, "sequence",
+				current.sequence, "round", current.round, "proposer", proposerStr, "preprepare is nil?",
+				current.Preprepare == nil, "len(prepares)", preparesSize, "len(commits)", commitsSize)
+
+			if preparesSize > 0 {
+				logger.Warn("[RC] Prepares:", "messages", current.Prepares.GetMessages())
+			}
+			if commitsSize > 0 {
+				logger.Warn("[RC] Commits:", "messages", current.Commits.GetMessages())
+			}
+		}
+
+		c.sendEvent(timeoutEvent{&bft.View{
+			Sequence: current.sequence,
+			Round:    new(big.Int).Add(current.round, common.Big1),
+		}})
+	}))
+
+	logger.Debug("New RoundChangeTimer Set", "seq", c.current.Sequence(), "round", round, "timeout", timeout)
+}
+
+func (c *core) checkValidatorSignature(data []byte, sig []byte) (common.Address, error) {
+	// 1. Get signature address
+	signer, err := istanbul.GetSignatureAddress(data, sig)
+	if err != nil {
+		logger.Error("Failed to get signer address", "err", err)
+		return common.Address{}, err
+	}
+
+	// 2. Check validator
+	if c.current.qualified.Contains(signer) {
+		return signer, nil
+	}
+
+	return common.Address{}, istanbul.ErrUnauthorizedAddress
+}

@@ -1,0 +1,451 @@
+package impl
+
+import (
+	"fmt"
+	"math/big"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/kaiachain/kaia/blockchain/types"
+	"github.com/kaiachain/kaia/common"
+	"github.com/kaiachain/kaia/consensus"
+	"github.com/kaiachain/kaia/kaiax/gov"
+	"github.com/kaiachain/kaia/kaiax/gov/headergov"
+	"github.com/kaiachain/kaia/log"
+	"github.com/kaiachain/kaia/params"
+	"github.com/kaiachain/kaia/storage/database"
+	"golang.org/x/sync/singleflight"
+)
+
+var (
+	_ headergov.HeaderGovModule = (*headerGovModule)(nil)
+
+	// A background migration thread scans the epoch and stores all votes in DB.
+	// To prevent high CPU usage, the migration loop is throttled with a 50ms delay per iteration.
+	// For example, if migration starts at block 180,000,000, the entire process will take at least 0.5 hour.
+	migrationThrottlingDelay = 50 * time.Millisecond
+
+	logger = log.NewModuleLogger(log.KaiaxGov)
+)
+
+type chain interface {
+	consensus.ChainReaderWithSealer
+}
+
+type ValsetModule interface {
+	GetCouncil(num uint64) ([]common.Address, error)
+	GetProposer(num uint64, round uint64) (common.Address, error)
+}
+
+type InitOpts struct {
+	ChainKv     database.Database
+	ChainConfig *params.ChainConfig
+	Chain       chain
+	ValSet      ValsetModule
+	NodeAddress common.Address
+}
+
+type headerGovModule struct {
+	ChainKv     database.Database
+	ChainConfig *params.ChainConfig
+	Chain       chain
+	ValSet      ValsetModule
+
+	groupedVotes headergov.GroupedVotesMap
+	governances  headergov.GovDataMap
+	history      headergov.History
+	mu           *sync.RWMutex
+
+	// scanGroup deduplicates concurrent slow-path epoch scans so that
+	// multiple simultaneous requests for the same unscanned epoch trigger
+	// only a single header scan.
+	scanGroup singleflight.Group
+
+	epoch uint64
+
+	// for APIs
+	nodeAddress common.Address
+	myVotes     []headergov.VoteData // queue
+
+	quit atomic.Int32 // stop the migration thread
+	wg   sync.WaitGroup
+}
+
+func NewHeaderGovModule() *headerGovModule {
+	return &headerGovModule{}
+}
+
+func (h *headerGovModule) Init(opts *InitOpts) error {
+	if err := validateOpts(opts); err != nil {
+		return err
+	}
+
+	h.ChainKv = opts.ChainKv
+	h.ChainConfig = opts.ChainConfig
+	h.Chain = opts.Chain
+	h.ValSet = opts.ValSet
+	h.nodeAddress = opts.NodeAddress
+
+	h.epoch = h.ChainConfig.Istanbul.Epoch
+	if h.epoch == 0 {
+		return ErrZeroEpoch
+	}
+
+	// init memory
+	h.groupedVotes = make(map[uint64]headergov.VotesInEpoch)
+	h.governances = make(map[uint64]headergov.GovData)
+	h.history = make(headergov.History)
+	h.myVotes = make([]headergov.VoteData, 0)
+	h.mu = &sync.RWMutex{}
+
+	h.initSchema()
+
+	govs := readGovDataFromDB(h.Chain, h.ChainKv)
+	for blockNum, gov := range govs {
+		h.AddGov(blockNum, gov)
+	}
+
+	votes := readVoteDataFromDB(h.Chain, h.ChainKv)
+	for blockNum, vote := range votes {
+		h.AddVote(blockNum, vote)
+	}
+
+	return nil
+}
+
+func (h *headerGovModule) initSchema() {
+	// 1. Init gov from legacy governance DB, if empty.
+	if ReadGovDataBlockNums(h.ChainKv) == nil {
+		legacyGovBlockNums := ReadLegacyIdxHistory(h.ChainKv)
+		if legacyGovBlockNums == nil {
+			legacyGovBlockNums = StoredUint64Array{0}
+		}
+		WriteGovDataBlockNums(h.ChainKv, legacyGovBlockNums)
+	}
+
+	// 2. Init vote and lowest vote scanned epoch index, if empty.
+	if ReadLowestVoteScannedEpochIdx(h.ChainKv) == nil {
+		latestEpochIdx := calcEpochIdx(h.Chain.CurrentBlock().NumberU64(), h.epoch)
+		h.accumulateVotesInEpoch(latestEpochIdx)
+	}
+}
+
+func (h *headerGovModule) Start() error {
+	logger.Info("HeaderGovModule started")
+
+	// Reset the quit state.
+	h.quit.Store(0)
+	h.wg.Add(1)
+	go h.migrate()
+
+	return nil
+}
+
+func (h *headerGovModule) Stop() {
+	logger.Info("HeaderGovModule stopped")
+	h.quit.Store(1)
+	h.wg.Wait()
+}
+
+func (h *headerGovModule) migrate() {
+	defer h.wg.Done()
+
+	// Scan all epochs in the background including 0th epoch
+	pBorder := ReadLowestVoteScannedEpochIdx(h.ChainKv)
+	if pBorder == nil {
+		logger.Crit("Unexpected nil: lowest vote scanned epoch index")
+		return
+	}
+
+	border := *pBorder
+
+	for int64(border) > 0 {
+		if h.quit.Load() == 1 {
+			return
+		}
+
+		time.Sleep(migrationThrottlingDelay)
+
+		border -= 1
+		h.accumulateVotesInEpoch(border)
+	}
+
+	if border == 0 {
+		logger.Info("HeaderGovModule migrate complete")
+	}
+}
+
+func (h *headerGovModule) isKoreHF(num uint64) bool {
+	return h.ChainConfig.IsKoreForkEnabled(new(big.Int).SetUint64(num))
+}
+
+func (h *headerGovModule) PushMyVotes(vote headergov.VoteData) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.myVotes = append(h.myVotes, vote)
+}
+
+func (h *headerGovModule) PopMyVotes(idx int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if idx < 0 || idx >= len(h.myVotes) {
+		return
+	}
+	h.myVotes = append(h.myVotes[:idx], h.myVotes[idx+1:]...)
+}
+
+func (h *headerGovModule) peekMyVote() (headergov.VoteData, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if len(h.myVotes) == 0 {
+		return nil, false
+	}
+	return h.myVotes[0], true
+}
+
+func (h *headerGovModule) myVotesSnapshot() []headergov.VoteData {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	ret := make([]headergov.VoteData, len(h.myVotes))
+	copy(ret, h.myVotes)
+	return ret
+}
+
+func (h *headerGovModule) removeMyVote(vote headergov.VoteData) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for i, myvote := range h.myVotes {
+		if isEqualVotes(myvote, vote) {
+			logger.Debug("Removing myvote", "vote", myvote)
+			h.myVotes = append(h.myVotes[:i], h.myVotes[i+1:]...)
+			return
+		}
+	}
+}
+
+// scanAllVotesInEpoch scans all votes from headers in the given epoch.
+func (h *headerGovModule) scanAllVotesInEpoch(epochIdx uint64) map[uint64]headergov.VoteData {
+	rangeStart := calcEpochStartBlock(epochIdx, h.epoch)
+	rangeEnd := calcEpochStartBlock(epochIdx+1, h.epoch)
+	if currBlock := h.Chain.CurrentBlock().NumberU64(); rangeEnd > currBlock {
+		rangeEnd = currBlock + 1 // so currBlock is scanned
+	}
+
+	votes := make(map[uint64]headergov.VoteData)
+	for blockNum := rangeStart; blockNum < rangeEnd; blockNum++ {
+		header := h.Chain.GetHeaderByNumber(blockNum)
+		if header == nil {
+			logger.Warn("Missing header found", "num", blockNum)
+			continue
+		}
+
+		if len(header.Vote) == 0 {
+			continue
+		}
+
+		vote, err := headergov.VoteBytes(header.Vote).ToVoteData()
+		if err != nil {
+			logger.Error("Failed to parse vote", "num", blockNum, "err", err)
+			continue
+		}
+
+		if vote == nil {
+			continue
+		}
+
+		// Only governance params are collected. Validator params are ignored.
+		if _, ok := gov.Params[vote.Name()]; ok {
+			votes[blockNum] = vote
+		}
+	}
+
+	return votes
+}
+
+// accumulateVotesInEpoch scans and saves votes to cache and DB.
+// Because this function updates lowestVoteScannedEpochIdx, it verifies epochIdx.
+func (h *headerGovModule) accumulateVotesInEpoch(epochIdx uint64) {
+	pBorder := ReadLowestVoteScannedEpochIdx(h.ChainKv)
+	if pBorder != nil && *pBorder != epochIdx+1 {
+		logger.Error("Invalid epochIdx", "epochIdx", epochIdx, "lowestScanned", *pBorder)
+		return
+	}
+
+	votes := h.scanAllVotesInEpoch(epochIdx)
+	for blockNum, vote := range votes {
+		h.AddVote(blockNum, vote)
+		InsertVoteDataBlockNum(h.ChainKv, blockNum)
+	}
+
+	WriteLowestVoteScannedEpochIdx(h.ChainKv, epochIdx)
+	logger.Info("Accumulated votes", "epochIdx", epochIdx)
+}
+
+// forEachIndexedHeader calls fn for each indexed block whose header is present. A block
+// above head is no longer on the canonical chain, so it is skipped; a missing header at or
+// below head means the canonical chain is broken (fatal).
+func forEachIndexedHeader(chain chain, blockNums StoredUint64Array, kind string, fn func(blockNum uint64, header *types.Header)) {
+	head := chain.CurrentBlock().NumberU64()
+	for _, blockNum := range blockNums {
+		header := chain.GetHeaderByNumber(blockNum)
+		if header == nil {
+			if blockNum > head {
+				logger.Warn("Skipping stale block above head", "kind", kind, "num", blockNum, "head", head)
+				continue
+			}
+			logger.Crit("Missing canonical header for indexed block", "kind", kind, "num", blockNum, "head", head)
+		}
+
+		fn(blockNum, header)
+	}
+}
+
+func readVoteDataFromDB(chain chain, db database.Database) map[uint64]headergov.VoteData {
+	votes := make(map[uint64]headergov.VoteData)
+	forEachIndexedHeader(chain, ReadVoteDataBlockNums(db), "vote",
+		func(blockNum uint64, header *types.Header) {
+			parsedVote, err := headergov.VoteBytes(header.Vote).ToVoteData()
+			if err != nil {
+				panic(err)
+			}
+			votes[blockNum] = parsedVote
+		},
+	)
+	return votes
+}
+
+func readGovDataFromDB(chain chain, db database.Database) map[uint64]headergov.GovData {
+	govs := make(map[uint64]headergov.GovData)
+	forEachIndexedHeader(chain, ReadGovDataBlockNums(db), "gov",
+		func(blockNum uint64, header *types.Header) {
+			parsedGov, err := headergov.GovBytes(header.Governance).ToGovData()
+			if err != nil {
+				// For tests, genesis' governance can be nil: omit from cache.
+				if blockNum == 0 {
+					return
+				}
+				logger.Error("Failed to parse gov", "num", blockNum, "err", err)
+				panic("failed to parse gov")
+			}
+			govs[blockNum] = parsedGov
+		},
+	)
+	return govs
+}
+
+func calcEpochIdx(blockNum uint64, epoch uint64) uint64 {
+	return blockNum / epoch
+}
+
+func calcEpochStartBlock(epochIdx uint64, epoch uint64) uint64 {
+	return epochIdx * epoch
+}
+
+func validateOpts(opts *InitOpts) error {
+	switch {
+	case opts == nil:
+		return errInitNil("opts")
+	case opts.ChainKv == nil:
+		return errInitNil("opts.ChainKv")
+	case opts.ChainConfig == nil:
+		return errInitNil("opts.ChainConfig")
+	case opts.ChainConfig.Istanbul == nil:
+		return errInitNil("opts.ChainConfig.Istanbul")
+	case opts.Chain == nil:
+		return errInitNil("opts.Chain")
+	}
+
+	return nil
+}
+
+// GetGenesisGovBytes returns the genesis governance bytes for initGenesis().
+// It panics if the given chain config is invalid.
+func GetGenesisGovBytes(config *params.ChainConfig) headergov.GovBytes {
+	partialParamSet := make(gov.PartialParamSet)
+	genesisParamNames := getGenesisParamNames(config)
+	for _, name := range genesisParamNames {
+		param := gov.Params[name]
+		value, err := param.ChainConfigValue(config)
+		if err != nil {
+			panic(err)
+		}
+
+		err = partialParamSet.Add(string(name), value)
+		if err != nil {
+			panic(fmt.Errorf("failed to add param %s: %w", name, err))
+		}
+	}
+
+	govData := headergov.NewGovData(partialParamSet)
+	ret, err := govData.ToGovBytes()
+	if err != nil {
+		panic(err)
+	}
+
+	return ret
+}
+
+// getGenesisParamNames returns a subset of parameters to be included
+// in the genesis block header's Governance field.
+// The subset depends on genesis block's hardfork level and genesis chain config.
+// For backward compatibility, some fields may be intentionally omitted.
+func getGenesisParamNames(config *params.ChainConfig) []gov.ParamName {
+	genesisParamNames := make([]gov.ParamName, 0)
+
+	// DeriveShaImpl is excluded unless the genesis is Kore HF,
+	// even though it has been always included in the genesis chain config.
+	if config.Governance != nil {
+		genesisParamNames = append(genesisParamNames, []gov.ParamName{
+			gov.GovernanceGovernanceMode, gov.GovernanceGoverningNode, gov.GovernanceUnitPrice,
+			gov.RewardMintingAmount, gov.RewardRatio, gov.RewardUseGiniCoeff,
+			gov.RewardDeferredTxFee, gov.RewardMinimumStake,
+			gov.RewardStakingUpdateInterval, gov.RewardProposerUpdateInterval,
+		}...)
+	}
+
+	if config.Istanbul != nil {
+		genesisParamNames = append(genesisParamNames, []gov.ParamName{
+			gov.IstanbulEpoch, gov.IstanbulPolicy, gov.IstanbulCommitteeSize,
+		}...)
+	}
+
+	if config.IsMagmaForkEnabled(common.Big0) &&
+		config.Governance.KIP71 != nil {
+		genesisParamNames = append(genesisParamNames, []gov.ParamName{
+			gov.Kip71LowerBoundBaseFee, gov.Kip71UpperBoundBaseFee, gov.Kip71GasTarget,
+			gov.Kip71BaseFeeDenominator, gov.Kip71MaxBlockGasUsedForBaseFee,
+		}...)
+	}
+
+	if config.IsKoreForkEnabled(common.Big0) &&
+		config.Governance != nil {
+		genesisParamNames = append(genesisParamNames, gov.GovernanceDeriveShaImpl)
+		if !common.EmptyAddress(config.Governance.GovParamContract) {
+			genesisParamNames = append(genesisParamNames, gov.GovernanceGovParamContract)
+		}
+		if config.Governance.Reward != nil &&
+			config.Governance.Reward.Kip82Ratio != "" {
+			genesisParamNames = append(genesisParamNames, gov.RewardKip82Ratio)
+		}
+	}
+
+	if config.IsOsakaForkEnabled(common.Big0) &&
+		config.Governance != nil {
+		if config.Governance.Reward != nil &&
+			config.Governance.Reward.StakingRewardThreshold != nil {
+			genesisParamNames = append(genesisParamNames, gov.RewardStakingRewardThreshold)
+		}
+		if config.Governance.Reward != nil &&
+			config.Governance.Reward.UseFlexReward {
+			genesisParamNames = append(genesisParamNames, gov.RewardUseFlexReward)
+		}
+	}
+
+	return genesisParamNames
+}

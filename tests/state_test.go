@@ -1,0 +1,268 @@
+// Modifications Copyright 2024 The Kaia Authors
+// Modifications Copyright 2018 The klaytn Authors
+// Copyright 2015 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+//
+// This file is derived from tests/state_test.go (2018/06/04).
+// Modified and improved for the klaytn development.
+// Modified and improved for the Kaia development.
+
+package tests
+
+import (
+	"bytes"
+	"fmt"
+	"reflect"
+	"testing"
+
+	"github.com/kaiachain/kaia/blockchain/vm"
+	"github.com/kaiachain/kaia/common"
+	"github.com/kaiachain/kaia/log"
+	"github.com/kaiachain/kaia/params"
+	"github.com/stretchr/testify/suite"
+)
+
+// TestKaiaSpecState runs the StateTests fixtures from kaia-core-tests
+func TestKaiaSpecState(t *testing.T) {
+	log.EnableLogForTest(log.LvlCrit, log.LvlError)
+	t.Parallel()
+
+	st := new(testMatcher)
+	// Long tests:
+	st.skipShortMode(`^stQuadraticComplexityTest/`)
+	// Broken tests:
+	st.skipLoad(`^stTransactionTest/OverflowGasRequire.json`) // gasLimit > 256 bits
+	st.skipLoad(`^stTransactionTest/zeroSigTransa[^/]*.json`) // EIP-86 is not supported yet
+	// Expected failures:
+	st.fails(`^stRevertTest/RevertPrecompiledTouch.json/Byzantium`, "bug in test")
+	st.skipLoad(`^stZeroKnowledge2/ecmul_0-3_5616_28000_96.json`)
+
+	// Skip since the tests transfer values to precompiled contracts
+	st.skipLoad(`^stPreCompiledContracts2/CallSha256_1_nonzeroValue.json`)
+	st.skipLoad(`^stPreCompiledContracts2/CallIdentity_1_nonzeroValue.json`)
+	st.skipLoad(`^stPreCompiledContracts2/CallEcrecover0_NoGas.json`)
+	st.skipLoad(`^stRandom2/randomStatetest644.json`)
+	st.skipLoad(`^stRandom2/randomStatetest645.json`)
+	st.skipLoad(`^stStaticCall/static_CallIdentity_1_nonzeroValue.json`)
+	st.skipLoad(`^stStaticCall/static_CallSha256_1_nonzeroValue.json`)
+	st.skipLoad(`^stArgsZeroOneBalance/callNonConst.json`)
+	st.skipLoad(`^stPreCompiledContracts2/modexpRandomInput.json`)
+	st.skipLoad(`^stRandom2/randomStatetest642.json`)
+
+	st.walk(t, stateTestDir, func(t *testing.T, name string, test *StateTest) {
+		execStateTest(t, st, test, name, []string{"Constantinople"}, false)
+	})
+}
+
+// TestExecutionSpecState runs the state_test fixtures from execution-spec-tests.
+
+type ExecutionSpecStateTestSuite struct {
+	suite.Suite
+	originalIsPrecompiledContractAddress func(common.Address, interface{}) bool
+	originalBlobTxMaxBlobs               int
+}
+
+func (suite *ExecutionSpecStateTestSuite) SetupSuite() {
+	suite.originalIsPrecompiledContractAddress = common.IsPrecompiledContractAddress
+	common.IsPrecompiledContractAddress = isPrecompiledContractAddressForEthTest
+	suite.originalBlobTxMaxBlobs = params.BlobTxMaxBlobs
+	params.BlobTxMaxBlobs = EthBlobTxMaxBlobs
+}
+
+func (suite *ExecutionSpecStateTestSuite) TearDownSuite() {
+	common.IsPrecompiledContractAddress = suite.originalIsPrecompiledContractAddress
+	params.BlobTxMaxBlobs = suite.originalBlobTxMaxBlobs
+}
+
+func (suite *ExecutionSpecStateTestSuite) TestExecutionSpecState() {
+	t := suite.T()
+
+	if !common.FileExist(executionSpecStateTestDir) {
+		t.Skipf("directory %s does not exist", executionSpecStateTestDir)
+	}
+	st := new(testMatcher)
+
+	// TODO-Kaia: should remove these skip
+	// executing precompiled contracts with value transferring is not permitted
+	st.skipLoad(`^frontier/opcodes/all_opcodes/all_opcodes.json`)
+	// "to" is address_0x0000000000000000000000000000000000000005: insertion error because precompiled contract address validation in TxInternalData#Validate
+	// https://github.com/kaiachain/kaia/blob/d44ae2f4269a84bd379b4e992d8e3be46b7e5ad3/blockchain/types/tx_internal_data_legacy.go#L365
+	st.skipLoad(`^prague/eip7702_set_code_tx/set_code_txs_2/call_to_precompile_in_pointer_context.json/tests/prague/eip7702_set_code_tx/test_set_code_txs_2.py::test_call_to_precompile_in_pointer_context\[fork_Osaka-precompile_0x0000000000000000000000000000000000000005-`)
+
+	// tests to skip
+	// unsupported EIPs
+	st.skipLoad(`^cancun/eip4788_beacon_root/`)
+	// type 3 tx (EIP-4844) is not supported before Osaka
+	st.skipLoad(`^cancun/eip4844_blobs/.*\[fork_(Cancun|Prague)`)
+	st.skipLoad(`^static/state_tests/Cancun/stEIP4844_blobtransactions/.*\[fork_(Cancun|Prague)`)
+	st.skipLoad(`^istanbul/eip1344_chainid/.*\[fork_(Cancun|Prague).*typed_transaction_3`)
+	st.skipLoad(`^prague/eip7623_increase_calldata_cost/.*\[fork_(Cancun|Prague).*type_3`)
+	st.skipLoad(`^prague/eip7623_increase_calldata_cost/test_transaction_validity_type_3.json/tests/prague/eip7623_increase_calldata_cost/test_transaction_validity.py::test_transaction_validity_type_3\[fork_(Cancun|Prague)`)
+	// EIP-3607 is not implemented because Kaia can't reject the TxFromSenderEOA since Kaia have a contract code at the zero address and people usually use from == 0x0 to call the view function
+	st.skipLoad(`^prague/eip7702_set_code_tx/set_code_txs/set_code_from_account_with_non_delegating_code.json/tests/prague/eip7702_set_code_tx/test_set_code_txs.py::test_set_code_from_account_with_non_delegating_code`)
+	st.skipLoad(`^static/state_tests/stEIP3607/transactionCollidingWithNonEmptyAccount_calls.json`)
+	st.skipLoad(`^static/state_tests/stEIP3607/transactionCollidingWithNonEmptyAccount_send_Paris.json`)
+	st.skipLoad(`^static/state_tests/stEIP3607/transactionCollidingWithNonEmptyAccount_callsItself.json`)
+	st.skipLoad(`^static/state_tests/stEIP3607/transactionCollidingWithNonEmptyAccount_init_Paris.json`)
+
+	// TODO: Skip EIP tests that are not yet supported; expect to remove them
+	st.skipLoad(`osaka/eip7825_transaction_gas_limit_cap`)
+	// post state root mismatch: the address is reserved for pre-compiled contracts
+	st.skipLoad(`^osaka/eip7883_modexp_gas_increase/test_modexp_used_in_transaction_entry_points.json`)
+
+	// TODO: Investigate after all Osaka EIPs are applied
+	st.skipLoad(`^frontier/identity_precompile/identity/call_identity_precompile.json/tests/frontier/identity_precompile/test_identity.py::test_call_identity_precompile\[fork_Osaka-state_test-identity_1_nonzerovalue-call_type_CALL\]`)
+
+	// TODO: Investigate skip or ignore these tests
+	// EIP-7702 is not fully supported
+	st.skipLoad(`^prague/eip7702_set_code_tx/test_set_code_from_account_with_non_delegating_code.json`)
+	// EIP-2537 BLS12-381 precompiles are not supported
+	st.skipLoad(`^prague/eip2537_bls_12_381_precompiles/`)
+	// post state root mismatch: account balance mismatch
+	st.skipLoad(`^frontier/precompiles/precompiles/precompiles.json`)
+	st.skipLoad(`^frontier/precompiles/precompile_absence/precompile_absence.json`)
+	st.skipLoad(`^frontier/precompiles/test_precompile_absence.json`)
+	st.skipLoad(`^frontier/precompiles/test_precompiles.json`)
+	st.skipLoad(`^frontier/opcodes/test_all_opcodes.json`)
+	st.skipLoad(`^frontier/identity_precompile/test_call_identity_precompile.json`)
+	st.skipLoad(`^frontier/create/test_create_one_byte.json`)
+	// post state root mismatch
+	st.skipLoad(`^static/state_tests/stSpecialTest/failed_tx_xcf416c53_Paris.json`)
+	st.skipLoad(`^static/state_tests/stRandom/randomStatetest26.json`)
+	st.skipLoad(`^static/state_tests/stRandom/randomStatetest36.json`)
+	st.skipLoad(`^static/state_tests/stRandom/randomStatetest100.json`)
+	st.skipLoad(`^static/state_tests/stRandom/randomStatetest138.json`)
+	st.skipLoad(`^static/state_tests/stRandom/randomStatetest139.json`)
+	st.skipLoad(`^static/state_tests/stRandom/randomStatetest146.json`)
+	st.skipLoad(`^static/state_tests/stRandom/randomStatetest153.json`)
+	st.skipLoad(`^static/state_tests/stRandom/randomStatetest246.json`)
+	st.skipLoad(`^static/state_tests/stRandom/randomStatetest303.json`)
+	st.skipLoad(`^static/state_tests/stRandom/randomStatetest367.json`)
+	st.skipLoad(`^static/state_tests/stRandom2/randomStatetest417.json`)
+	st.skipLoad(`^static/state_tests/stRandom2/randomStatetest466.json`)
+	st.skipLoad(`^static/state_tests/stRandom2/randomStatetest476.json`)
+	st.skipLoad(`^static/state_tests/stRandom2/randomStatetest577.json`)
+	st.skipLoad(`^static/state_tests/stRandom2/randomStatetest581.json`)
+	st.skipLoad(`^static/state_tests/stRandom2/randomStatetest627.json`)
+	st.skipLoad(`^static/state_tests/stRandom2/randomStatetest632.json`)
+	st.skipLoad(`^static/state_tests/stRandom2/randomStatetest642.json`)
+	st.skipLoad(`^static/state_tests/stRandom2/randomStatetest644.json`)
+	st.skipLoad(`^static/state_tests/stRandom2/randomStatetest645.json`)
+	st.skipLoad(`^static/state_tests/stRandom2/randomStatetest650.json`)
+	// post state root mismatch
+	st.skipLoad(`^osaka/eip7951_p256verify_precompiles/test_precompile_will_return_success_with_tx_value.json`)
+	st.skipLoad(`^static/state_tests/stTransactionTest/Opcodes_TransactionInit.json`)
+	st.skipLoad(`^static/state_tests/stExample/mergeTest.json`)
+	st.skipLoad(`^static/state_tests/stEIP1559/lowFeeCap.json`)
+	st.skipLoad(`^static/state_tests/stPreCompiledContracts2/modexpRandomInput.json/tests/`)
+	// post state root mismatch: tests transfer values to precompiled contracts
+	st.skipLoad(`^static/state_tests/stPreCompiledContracts2/CallSha256_1_nonzeroValue.json`)
+	st.skipLoad(`^static/state_tests/stPreCompiledContracts2/CallEcrecover0_NoGas.json`)
+	st.skipLoad(`^static/state_tests/stStaticCall/static_CallSha256_1_nonzeroValue.json`)
+	st.skipLoad(`^static/state_tests/stStaticCall/static_CallIdentity_1_nonzeroValue.json`)
+	// post state validation failed: account balance/nonce/code mismatch
+	st.skipLoad(`^static/state_tests/stCreateTest/CreateTransactionRefundEF.json`)
+	st.skipLoad(`^static/state_tests/stCreateTest/CREATE_HighNonce.json`)
+	st.skipLoad(`^static/state_tests/stCreateTest/CREATE2_RefundEF.json`)
+	st.skipLoad(`^static/state_tests/stCreateTest/CreateAddressWarmAfterFail.json`)
+	st.skipLoad(`^static/state_tests/stCreate2/CREATE2_HighNonce.json`)
+	st.skipLoad(`^static/state_tests/stCreate2/CREATE2_FirstByte_loop.json`)
+	st.skipLoad(`^static/state_tests/stCreate2/CREATE2_HighNonceDelegatecall.json`)
+	// post state validation failed
+	st.skipLoad(`^static/state_tests/VMTests/vmTests/blockInfo.json`)
+	st.skipLoad(`^static/state_tests/stArgsZeroOneBalance/callNonConst.json`)
+	st.skipLoad(`^static/state_tests/stPreCompiledContracts/precompsEIP2929Cancun.json`)
+	// expected error but got no error
+	st.skipLoad(`^static/state_tests/stEIP1559/tipTooHigh.json`)
+	st.skipLoad(`^static/state_tests/stEIP1559/transactionIntinsicBug_Paris.json`)
+	st.skipLoad(`^static/state_tests/stEIP1559/lowGasLimit.json`)
+	// panic: can't encode object at ...: rlp: cannot encode negative big.Int
+	st.skipLoad(`^static/state_tests/stEIP1559/lowGasPriceOldTypes.json`)
+
+	st.walk(t, executionSpecStateTestDir, func(t *testing.T, name string, test *StateTest) {
+		execStateTest(t, st, test, name, []string{
+			// Even if we skip fork levels, old EIPs are still retrospectively tested against Cancun or later forks.
+			// The EEST framework was added when Kaia was at Cancun hardfork. Previous forks will be, and continue to be tested with kaia-core-tests.
+			"Frontier",
+			"Homestead",
+			"Byzantium",
+			"Constantinople",
+			"ConstantinopleFix",
+			"Istanbul",
+			"Berlin",
+			"London",
+			"Merge",
+			"Paris",
+			"Shanghai",
+			// "Cancun",
+			// "Prague",
+			// "Osaka",
+		}, true)
+	})
+}
+
+func TestExecutionSpecStateTestSuite(t *testing.T) {
+	log.EnableLogForTest(log.LvlCrit, log.LvlError)
+	suite.Run(t, new(ExecutionSpecStateTestSuite))
+}
+
+func execStateTest(t *testing.T, st *testMatcher, test *StateTest, name string, skipForks []string, isTestExecutionSpecState bool) {
+	for _, subtest := range test.Subtests() {
+		key := fmt.Sprintf("%s/%d", subtest.Fork, subtest.Index)
+		name := name + "/" + key
+		t.Run(key, func(t *testing.T) {
+			for _, skip := range skipForks {
+				if skip == subtest.Fork {
+					t.Skipf("%s not supported yet", subtest.Fork)
+				}
+			}
+			withTrace(t, test.gasLimit(subtest), func(vmconfig vm.Config) error {
+				err := test.Run(subtest, vmconfig, isTestExecutionSpecState)
+				return st.checkFailure(t, name, err)
+			})
+		})
+	}
+}
+
+// Transactions with gasLimit above this value will not get a VM trace on failure.
+const traceErrorLimit = 400000
+
+func withTrace(t *testing.T, gasLimit uint64, test func(vm.Config) error) {
+	// Set ComputationCostLimit as infinite
+	err := test(vm.Config{ComputationCostLimit: params.OpcodeComputationCostLimitInfinite})
+	if err == nil {
+		return
+	}
+	t.Error(err)
+	if gasLimit > traceErrorLimit {
+		t.Log("gas limit too high for EVM trace")
+		return
+	}
+	tracer := vm.NewStructLogger(nil)
+	err2 := test(vm.Config{Debug: true, Tracer: tracer, ComputationCostLimit: params.OpcodeComputationCostLimitInfinite})
+	if !reflect.DeepEqual(err, err2) {
+		t.Errorf("different error for second run: %v", err2)
+	}
+	buf := new(bytes.Buffer)
+	vm.WriteTrace(buf, tracer.StructLogs())
+	if buf.Len() == 0 {
+		t.Log("no EVM operation logs generated")
+	} else {
+		t.Log("EVM operation log:\n" + buf.String())
+	}
+	t.Logf("EVM output: 0x%x", tracer.Output())
+	t.Logf("EVM error: %v", tracer.Error())
+}

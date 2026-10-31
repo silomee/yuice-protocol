@@ -1,0 +1,90 @@
+// Modifications Copyright 2024 The Kaia Authors
+// Modifications Copyright 2018 The klaytn Authors
+// Copyright 2017 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+//
+// This file is derived from quorum/consensus/istanbul/backend.go (2018/06/04).
+// Modified and improved for the klaytn development.
+// Modified and improved for the Kaia development.
+
+package istanbul
+
+import (
+	"math/big"
+	"time"
+
+	"github.com/kaiachain/kaia/common"
+	"github.com/kaiachain/kaia/consensus/bft"
+	"github.com/kaiachain/kaia/event"
+)
+
+// Backend provides application specific functions for Istanbul core
+//
+//go:generate mockgen -destination=./mocks/backend_mock.go -package=mock_istanbul github.com/kaiachain/kaia/consensus/istanbul Backend
+type Backend interface {
+	// Address returns the owner's address
+	Address() common.Address
+
+	// Sealer returns the seal handler used by this backend.
+	Sealer() *IstanbulSealer
+
+	// EventMux returns the event mux in backend
+	EventMux() *event.TypeMux
+
+	// Broadcast sends a message to all validators (include self)
+	Broadcast(prevHash common.Hash, payload []byte) error
+
+	// Gossip sends a message to all validators (exclude self)
+	Gossip(payload []byte) error
+
+	GossipSubPeer(prevHash common.Hash, payload []byte)
+
+	// Commit delivers an approved proposal to backend.
+	// The delivered proposal will be put into blockchain.
+	Commit(proposal bft.Proposal, seals [][]byte) error
+
+	// Verify verifies the proposal. If a consensus.ErrFutureBlock error is returned,
+	// the time difference of the proposal and current time is also returned.
+	Verify(bft.Proposal) (time.Duration, error)
+
+	// VerifyProposalBody verifies the proposal body rules that are independent
+	// of local bad-block state, header time and proposer seals.
+	VerifyProposalBody(bft.Proposal) error
+
+	// Sign signs input data with the backend's private key
+	Sign([]byte) ([]byte, error)
+
+	// LastProposal retrieves latest committed proposal and the address of proposer
+	LastProposal() (bft.Proposal, common.Address)
+
+	// ProposalRound returns the round stored in the matching block, and whether it exists.
+	ProposalRound(hash common.Hash, number *big.Int) (byte, bool)
+
+	// HasBadProposal returns whether the proposal with the hash is a bad proposal
+	HasBadProposal(hash common.Hash) bool
+
+	// VerifyProposalExecution executes the proposal on its parent state and
+	// validates the result without importing it. A failure is recorded as a bad
+	// proposal, as it would be on import, so HasBadProposal reports it afterwards.
+	VerifyProposalExecution(bft.Proposal) error
+
+	SetCurrentView(view *bft.View)
+
+	NodeType() common.ConnType
+
+	// IsPermissionlessAt reports whether the permissionless fork is enabled at num.
+	IsPermissionlessAt(num uint64) bool
+}

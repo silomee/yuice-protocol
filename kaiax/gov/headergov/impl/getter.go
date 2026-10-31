@@ -1,0 +1,80 @@
+package impl
+
+import (
+	"maps"
+	"slices"
+
+	"github.com/kaiachain/kaia/common"
+	"github.com/kaiachain/kaia/kaiax/gov"
+)
+
+func (h *headerGovModule) GetParamSet(blockNum uint64) gov.ParamSet {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	prevEpochStart := PrevEpochStart(blockNum, h.epoch, h.isKoreHF(blockNum))
+	gh := h.history
+	gp, err := gh.Search(prevEpochStart)
+	if err != nil {
+		logger.Warn("No param set", "blockNum", blockNum, "prevEpochStart", prevEpochStart)
+		return *gov.GetDefaultGovernanceParamSet()
+	}
+	return gp
+}
+
+func (h *headerGovModule) GetPartialParamSet(blockNum uint64) gov.PartialParamSet {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	prevEpochStart := PrevEpochStart(blockNum, h.epoch, h.isKoreHF(blockNum))
+	ret := make(gov.PartialParamSet)
+
+	blockNums := slices.Collect(maps.Keys(h.governances))
+	slices.Sort(blockNums)
+	for _, num := range blockNums {
+		if num > prevEpochStart {
+			break
+		}
+		for name, value := range h.governances[num].Items() {
+			ret.Add(string(name), value)
+		}
+	}
+
+	return ret
+}
+
+func (h *headerGovModule) NodeAddress() common.Address {
+	return h.nodeAddress
+}
+
+func (h *headerGovModule) VoteBlockNums() []uint64 {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	blockNums := []uint64{}
+	for _, votes := range h.groupedVotes {
+		blockNums = append(blockNums, slices.Collect(maps.Keys(votes))...)
+	}
+
+	slices.Sort(blockNums)
+	return blockNums
+}
+
+func (h *headerGovModule) GovBlockNums() []uint64 {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	blockNums := slices.Collect(maps.Keys(h.governances))
+	slices.Sort(blockNums)
+	return blockNums
+}
+
+func PrevEpochStart(blockNum, epoch uint64, isKore bool) uint64 {
+	if blockNum <= epoch {
+		return 0
+	}
+	if !isKore {
+		blockNum -= 1
+	}
+	return blockNum - blockNum%epoch - epoch
+}

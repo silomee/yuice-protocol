@@ -1,0 +1,611 @@
+// Modifications Copyright 2024 The Kaia Authors
+// Modifications Copyright 2018 The klaytn Authors
+// Copyright 2017 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+//
+// This file is derived from quorum/consensus/istanbul/backend/backend.go (2018/06/04).
+// Modified and improved for the klaytn development.
+// Modified and improved for the Kaia development.
+
+package backend
+
+import (
+	"crypto/ecdsa"
+	"errors"
+	"fmt"
+	"math/big"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	lru "github.com/hashicorp/golang-lru"
+	"github.com/kaiachain/kaia/blockchain"
+	"github.com/kaiachain/kaia/blockchain/state"
+	"github.com/kaiachain/kaia/blockchain/types"
+	"github.com/kaiachain/kaia/common"
+	"github.com/kaiachain/kaia/consensus"
+	"github.com/kaiachain/kaia/consensus/bft"
+	"github.com/kaiachain/kaia/consensus/istanbul"
+	istanbulCore "github.com/kaiachain/kaia/consensus/istanbul/core"
+	"github.com/kaiachain/kaia/crypto"
+	"github.com/kaiachain/kaia/event"
+	"github.com/kaiachain/kaia/kaiax/valset"
+	"github.com/kaiachain/kaia/kaiax/vrank"
+	"github.com/kaiachain/kaia/log"
+	"github.com/kaiachain/kaia/params"
+)
+
+const (
+	// fetcherID is the ID indicates the block is from Istanbul engine
+	fetcherID = "istanbul"
+)
+
+var logger = log.NewModuleLogger(log.ConsensusIstanbulBackend)
+
+type BackendOpts struct {
+	IstanbulConfig *istanbul.Config  // Istanbul consensus core config
+	PrivateKey     *ecdsa.PrivateKey // Consensus message signing key
+	NodeType       common.ConnType
+}
+
+func New(opts *BackendOpts) consensus.Engine {
+	recentMessages, _ := lru.NewARC(inmemoryPeers)
+	knownMessages, _ := lru.NewARC(inmemoryMessages)
+	backend := &backend{
+		config:           opts.IstanbulConfig,
+		istanbulEventMux: new(event.TypeMux),
+		privateKey:       opts.PrivateKey,
+		address:          crypto.PubkeyToAddress(opts.PrivateKey.PublicKey),
+		logger:           logger.NewWith(),
+		commitCh:         make(chan *types.Result, 1),
+		candidates:       make(map[common.Address]bool),
+		recentMessages:   recentMessages,
+		knownMessages:    knownMessages,
+		sealer:           istanbul.NewSealerImpl(opts.PrivateKey),
+		nodetype:         opts.NodeType,
+		chainInitCh:      make(chan struct{}),
+	}
+
+	backend.currentView.Store(&bft.View{Sequence: big.NewInt(0), Round: big.NewInt(0)})
+	backend.core = istanbulCore.New(backend, backend.config)
+	return backend
+}
+
+// ----------------------------------------------------------------------------
+
+type backend struct {
+	config           *istanbul.Config
+	istanbulEventMux *event.TypeMux
+	privateKey       *ecdsa.PrivateKey
+	address          common.Address
+	core             istanbulCore.Engine
+	logger           log.Logger
+	chain            consensus.ChainReader
+
+	// the channels for istanbul engine notifications
+	commitCh          chan *types.Result
+	proposedBlockHash common.Hash
+	sealMu            sync.Mutex
+	sealSkippedNum    uint64 // block number that was committed before Seal started (0 = none)
+	sealNum           uint64 // block number of the Seal waiting on commitCh
+	coreStarted       atomic.Bool
+	coreMu            sync.RWMutex
+
+	// Current list of candidates we are pushing
+	candidates map[common.Address]bool
+	// Protects the signer fields
+	candidatesLock sync.RWMutex
+
+	// event subscription for ChainHeadEvent event
+	broadcaster consensus.Broadcaster
+
+	recentMessages *lru.ARCCache // the cache of peer's messages
+	knownMessages  *lru.ARCCache // the cache of self messages
+
+	currentView atomic.Value //*bft.View
+
+	// Reference to the kaiax modules
+	valsetModule valset.ValsetModule
+	sealer       *istanbul.IstanbulSealer
+
+	// VRank consensus-participation collection: accepted PRE-PREPAREs are relayed
+	// to the VRank module off the consensus hot path. nil until RegisterVRankModule.
+	vrankModule       vrank.VRankModule
+	prepreparedSub    *event.TypeMuxSubscription
+	prepreparedStopCh chan struct{}
+	prepreparedWg     sync.WaitGroup
+
+	// Node type
+	nodetype common.ConnType
+
+	chainInitCh   chan struct{} // closed when engine is ready for peer registration
+	chainInitOnce sync.Once
+
+	isRestoringSnapshots atomic.Bool
+
+	// Executor for transaction execution
+	executor consensus.Executor
+}
+
+func (sb *backend) Sealer() *istanbul.IstanbulSealer {
+	return sb.sealer
+}
+
+func (sb *backend) NodeType() common.ConnType {
+	return sb.nodetype
+}
+
+func (sb *backend) IsPermissionlessAt(num uint64) bool {
+	return sb.chain.Config().IsPermissionlessForkEnabled(new(big.Int).SetUint64(num))
+}
+
+// initSealState initializes state for Seal operation.
+// Returns the commitCh channel to wait on, or nil if the block was already committed.
+func (sb *backend) initSealState(number uint64, blockHash common.Hash) chan *types.Result {
+	sb.sealMu.Lock()
+	defer sb.sealMu.Unlock()
+
+	if sb.sealSkippedNum == number {
+		sb.sealSkippedNum = 0
+		return nil
+	}
+	if sb.commitCh != nil {
+		// A Seal for an older block that starts late leaves the current one alone.
+		if number < sb.sealNum {
+			return nil
+		}
+		// Release the previous Seal, which waits forever if this node never commits its block itself.
+		close(sb.commitCh)
+	}
+	sb.sealNum = number
+	sb.proposedBlockHash = blockHash
+	sb.commitCh = make(chan *types.Result, 1)
+	return sb.commitCh
+}
+
+// cleanupSealState cleans up state after the Seal waiting on commitCh completes.
+func (sb *backend) cleanupSealState(commitCh chan *types.Result) {
+	sb.sealMu.Lock()
+	defer sb.sealMu.Unlock()
+
+	// Keep the state of a newer Seal.
+	if sb.commitCh != nil && sb.commitCh != commitCh {
+		return
+	}
+	sb.proposedBlockHash = common.Hash{}
+	sb.commitCh = nil
+}
+
+func (sb *backend) SetCurrentView(view *bft.View) {
+	sb.currentView.Store(view)
+}
+
+// Address implements istanbul.Backend.Address
+func (sb *backend) Address() common.Address {
+	return sb.address
+}
+
+// Broadcast implements istanbul.Backend.Broadcast
+func (sb *backend) Broadcast(prevHash common.Hash, payload []byte) error {
+	// send to others
+	// TODO Check gossip again in event handle
+	// sb.Gossip(valSet, payload)
+	// send to self
+	msg := istanbul.MessageEvent{
+		Hash:    prevHash,
+		Payload: payload,
+	}
+	go sb.istanbulEventMux.Post(msg)
+	return nil
+}
+
+// Broadcast implements istanbul.Backend.Gossip
+func (sb *backend) Gossip(payload []byte) error {
+	hash := istanbul.RLPHash(payload)
+	sb.knownMessages.Add(hash, true)
+
+	if sb.broadcaster != nil {
+		ps := sb.broadcaster.GetCNPeers()
+		for addr, p := range ps {
+			ms, ok := sb.recentMessages.Get(addr)
+			var m *lru.ARCCache
+			if ok {
+				m, _ = ms.(*lru.ARCCache)
+				if _, k := m.Get(hash); k {
+					// This peer had this event, skip it
+					continue
+				}
+			} else {
+				m, _ = lru.NewARC(inmemoryMessages)
+			}
+
+			m.Add(hash, true)
+			sb.recentMessages.Add(addr, m)
+
+			cmsg := &bft.ConsensusMsg{
+				PrevHash: common.Hash{},
+				Payload:  payload,
+			}
+
+			go p.Send(consensus.ConsensusMsgCode, cmsg)
+		}
+	}
+	return nil
+}
+
+// getTargetReceivers returns a map of nodes which need to receive a message
+func (sb *backend) getTargetReceivers() map[common.Address]bool {
+	if sb.valsetModule == nil {
+		return nil
+	}
+	cv, ok := sb.currentView.Load().(*bft.View)
+	if !ok {
+		logger.Error("Failed to assert type from sb.currentView!!", "cv", cv)
+		return nil
+	}
+
+	num := cv.Sequence.Uint64()
+	// calculates a map of target nodes which need to receive a message
+	// committee[currentView].Union(committee[nextView]) => targets
+	targets := make(map[common.Address]bool)
+	for i := 0; i < 2; i++ {
+		round := cv.Round.Uint64() + uint64(i)
+		committee, err := sb.valsetModule.GetCommittee(num, round)
+		if err != nil {
+			return nil
+		}
+		committeeSet := valset.NewAddressSet(committee)
+		// i == 0: get current round's committee. additionally, check if the node is in the current view's committee
+		if i == 0 && !committeeSet.Contains(sb.Address()) {
+			return nil
+		}
+		for _, val := range committee {
+			if val != sb.Address() {
+				targets[val] = true
+			}
+		}
+	}
+	return targets
+}
+
+// GossipSubPeer implements istanbul.Backend.Gossip
+func (sb *backend) GossipSubPeer(prevHash common.Hash, payload []byte) {
+	targets := sb.getTargetReceivers()
+	if targets == nil {
+		return
+	}
+	hash := istanbul.RLPHash(payload)
+	sb.knownMessages.Add(hash, true)
+
+	if sb.broadcaster != nil && len(targets) > 0 {
+		ps := sb.broadcaster.FindCNPeers(targets)
+		for addr, p := range ps {
+			ms, ok := sb.recentMessages.Get(addr)
+			var m *lru.ARCCache
+			if ok {
+				m, _ = ms.(*lru.ARCCache)
+				if _, k := m.Get(hash); k {
+					// This peer had this event, skip it
+					continue
+				}
+			} else {
+				m, _ = lru.NewARC(inmemoryMessages)
+			}
+
+			m.Add(hash, true)
+			sb.recentMessages.Add(addr, m)
+
+			cmsg := &bft.ConsensusMsg{
+				PrevHash: prevHash,
+				Payload:  payload,
+			}
+
+			go p.Send(consensus.ConsensusMsgCode, cmsg)
+		}
+	}
+	return
+}
+
+// Commit implements istanbul.Backend.Commit
+func (sb *backend) Commit(proposal bft.Proposal, seals [][]byte) error {
+	// Check if the proposal is a valid block
+	block, ok := proposal.(*types.Block)
+	if !ok {
+		sb.logger.Error("Invalid proposal, %v", proposal)
+		return istanbul.ErrInvalidProposal
+	}
+	proposalHash := proposal.Hash()
+	h := block.Header()
+	round := sb.currentView.Load().(*bft.View).Round.Int64()
+	sb.sealer.WriteRound(h, round)
+	// Append seals into extra-data
+	if err := sb.sealer.WriteCommittedSeals(h, seals); err != nil {
+		return err
+	}
+	// update block's header
+	block = block.WithSeal(h)
+
+	sb.logger.Info("Committed", "number", proposal.Number().Uint64(), "hash", proposal.Hash(), "address", sb.Address())
+	// - if the proposed and committed blocks are the same, send the proposed hash
+	//   to commit channel, which is being watched inside the engine.Seal() function.
+	// - otherwise, we try to insert the block.
+	// -- if success, the ChainHeadEvent event will be broadcasted, try to build
+	//    the next block and the previous Seal() will be stopped.
+	// -- otherwise, a error will be returned and a round change event will be fired.
+
+	sb.sealMu.Lock()
+	if sb.proposedBlockHash == proposalHash {
+		// Proposer: feed block hash to Seal() and wait the Seal() result
+		if sb.commitCh != nil {
+			sb.commitCh <- &types.Result{Block: block, Round: round}
+		}
+		sb.sealMu.Unlock()
+		return nil
+	}
+
+	// Non-proposer: release the waiting Seal; a Seal for this block that hasn't started returns at once.
+	number := proposal.Number().Uint64()
+	if sb.commitCh != nil {
+		sb.commitCh <- nil
+	}
+	if sb.commitCh == nil || number > sb.sealNum {
+		sb.sealSkippedNum = number
+	}
+	sb.sealMu.Unlock()
+
+	if sb.broadcaster != nil {
+		sb.broadcaster.Enqueue(fetcherID, block)
+	}
+	return nil
+}
+
+// EventMux implements istanbul.Backend.EventMux
+func (sb *backend) EventMux() *event.TypeMux {
+	return sb.istanbulEventMux
+}
+
+// Verify implements istanbul.Backend.Verify
+func (sb *backend) Verify(proposal bft.Proposal) (time.Duration, error) {
+	// Check if the proposal is a valid block
+	block, ok := proposal.(*types.Block)
+	if !ok {
+		sb.logger.Error("Invalid proposal, %v", proposal)
+		return 0, istanbul.ErrInvalidProposal
+	}
+
+	// check bad block
+	if sb.HasBadProposal(block.Hash()) {
+		return 0, blockchain.ErrBlacklistedHash
+	}
+	if err := sb.VerifyProposalBody(block); err != nil {
+		return 0, err
+	}
+
+	// Verify the header of the proposed block. The proposal entry point skips the
+	// committed-seal rules by construction, so every other rule is enforced here and any
+	// failure rejects the proposal.
+	err := sb.chain.ValidateProposalHeader(block.Header())
+	if err == nil {
+		return 0, nil
+	} else if err == consensus.ErrFutureBlock {
+		return time.Unix(block.Header().Time.Int64(), 0).Sub(time.Now()), consensus.ErrFutureBlock
+	}
+	return 0, err
+}
+
+// VerifyProposalBody checks the body rules shared by ordinary PRE-PREPARE
+// validation and prepared-certificate admission. It deliberately excludes
+// local bad-block state and header validation, which are inappropriate for a
+// peer-supplied certificate and may depend on wall-clock time.
+func (sb *backend) VerifyProposalBody(proposal bft.Proposal) error {
+	block, ok := proposal.(*types.Block)
+	if !ok {
+		return istanbul.ErrInvalidProposal
+	}
+
+	// The checks below mirror BlockValidator.ValidateBody, so a bad proposal is rejected
+	// here instead of being PREPARE/COMMIT-ed and then refused on the import path.
+
+	// check EIP-7934 RLP-encoded block size cap
+	if sb.chain.Config().IsOsakaForkEnabled(block.Number()) && block.Size() > params.MaxBlockSize {
+		return blockchain.ErrBlockOversized
+	}
+
+	// check block body
+	header := block.Header()
+	txnHash := types.DeriveTransactionsRoot(block.Transactions(), block.Number())
+	if txnHash != header.TxHash {
+		return istanbul.ErrMismatchTxhashes
+	}
+	baseFee := header.BaseFee
+	var blobs int
+	for _, tx := range block.Transactions() {
+		if baseFee != nil && baseFee.Cmp(tx.GasPrice()) > 0 {
+			return fmt.Errorf("invalid GasPrice: txHash %x, GasPrice %d, BaseFee %d", tx.Hash(), tx.GasPrice(), baseFee)
+		}
+		blobs += len(tx.BlobHashes())
+		if tx.Type() == types.TxTypeEthereumBlob {
+			sidecar := tx.BlobTxSidecar()
+			if sidecar == nil {
+				sb.logger.Warn("No blob sidecar for blob transaction", "txHash", tx.Hash())
+				return istanbul.ErrNoBlobSidecarForBlobTx
+			}
+			if err := sidecar.ValidateWithBlobHashes(tx.BlobHashes()); err != nil {
+				sb.logger.Warn("Invalid blob transaction with sidecar", "txHash", tx.Hash(), "err", err)
+				return istanbul.ErrInvalidBlobTxWithSidecar
+			}
+		}
+	}
+	if header.BlobGasUsed != nil {
+		if want := *header.BlobGasUsed / params.BlobTxBlobGasPerBlob; uint64(blobs) != want {
+			return fmt.Errorf("blob gas used mismatch (header %v, calculated %v)", *header.BlobGasUsed, blobs*params.BlobTxBlobGasPerBlob)
+		}
+	} else if blobs > 0 {
+		return errors.New("data blobs present in block body")
+	}
+	return nil
+}
+
+// Sign implements istanbul.Backend.Sign
+func (sb *backend) Sign(data []byte) ([]byte, error) {
+	hashData := crypto.Keccak256([]byte(data))
+	return crypto.Sign(hashData, sb.privateKey)
+}
+
+func (sb *backend) ProposalRound(hash common.Hash, number *big.Int) (byte, bool) {
+	header := sb.chain.GetHeader(hash, number.Uint64())
+	if header == nil {
+		return 0, false
+	}
+	round, err := sb.Sealer().Round(header)
+	if err != nil {
+		return 0, false
+	}
+	return round, true
+}
+
+func (sb *backend) LastProposal() (bft.Proposal, common.Address) {
+	block := sb.chain.CurrentBlock()
+
+	var proposer common.Address
+	if block.Number().Cmp(common.Big0) > 0 {
+		var err error
+		proposer, err = sb.sealer.Author(block.Header())
+		if err != nil {
+			sb.logger.Error("Failed to get block proposer", "err", err)
+			return nil, common.Address{}
+		}
+	}
+
+	// Return header only block here since we don't need block body
+	return block, proposer
+}
+
+// VerifyProposalExecution implements istanbul.Backend.VerifyProposalExecution
+func (sb *backend) VerifyProposalExecution(proposal bft.Proposal) error {
+	block, ok := proposal.(*types.Block)
+	if !ok {
+		return istanbul.ErrInvalidProposal
+	}
+	return sb.chain.ValidateProposalExecution(block)
+}
+
+func (sb *backend) HasBadProposal(hash common.Hash) bool {
+	if sb.chain == nil {
+		return false
+	}
+	return sb.chain.HasBadBlock(hash)
+}
+
+// SubmitTransactions executes transactions and returns the execution result.
+// This moves transaction execution responsibility from worker to consensus.
+// Returns a channel that will receive the execution result when consensus is complete.
+// In Istanbul: execute first → then consensus → finalize → send result
+// In Kaia-BFT: consensus + execute in parallel → committed → send result
+func (sb *backend) SubmitTransactions(txs *types.TransactionsByPriceAndNonce, statedb *state.StateDB, header *types.Header, mux *event.TypeMux) (finalizeCh <-chan *consensus.ExecutionResult) {
+	resultCh := make(chan *consensus.ExecutionResult, 1)
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("SubmitTransactions panic", "err", r)
+				resultCh <- nil
+			}
+		}()
+
+		validators, err := sb.valsetModule.GetQualifiedValidators(header.Number.Uint64())
+		if err != nil {
+			resultCh <- nil
+			return
+		}
+		// Only qualified validators produce a block. Others skip here instead of
+		// doing the execute/finalize work and then failing authorization at Seal.
+		if !valset.NewAddressSet(validators).Contains(sb.address) {
+			resultCh <- nil
+			return
+		}
+		if err := sb.sealer.WriteValidators(header, validators); err != nil {
+			resultCh <- nil
+			return
+		}
+
+		// Reset executor with current state and header
+		if err := sb.executor.ResetWithState(statedb, header); err != nil {
+			resultCh <- nil
+			return
+		}
+
+		// Execute transactions
+		executeStart := time.Now()
+		result, err := sb.executor.Execute(txs, mux)
+		if err != nil {
+			resultCh <- nil
+			return
+		}
+		result.ExecuteTime = time.Since(executeStart)
+
+		// Finalize the block
+		finalizeStart := time.Now()
+		block, err := sb.executor.FinalizeState(result)
+		if err != nil {
+			resultCh <- nil
+			return
+		}
+		result.FinalizeTime = time.Since(finalizeStart)
+		result.Block = block
+
+		// Log block preparation completion (all validators log this, before seal)
+		logger.Info("Prepared new block",
+			"number", result.Block.Number(),
+			"hash", result.Block.Hash(),
+			"txs", len(result.Txs),
+			"elapsed", common.PrettyDuration(result.ExecuteTime+result.FinalizeTime),
+			"executeTime", common.PrettyDuration(result.ExecuteTime),
+			"finalizeTime", common.PrettyDuration(result.FinalizeTime))
+
+		// Trigger consensus (Seal) - this will run BFT consensus
+		// Seal is blocking until consensus is complete
+		// Stop signal is handled via commitCh close
+		sealStart := time.Now()
+		sealedBlock, err := sb.Seal(sb.chain, block)
+		result.SealTime = time.Since(sealStart)
+
+		if err != nil {
+			logger.Error("Failed to seal block", "err", err, "sealTime", result.SealTime)
+			resultCh <- nil
+			return
+		}
+		if sealedBlock == nil {
+			// Not the proposer - this is expected, block will be received via ChainHeadEvent
+			logger.Debug("Seal skipped. Not the proposer for block", "number", block.Number(), "sealTime", result.SealTime)
+			resultCh <- nil
+			return
+		}
+
+		logger.Info("Successfully sealed new block", "number", sealedBlock.Number(), "hash", sealedBlock.Hash(), "sealTime", result.SealTime)
+
+		result.Block = sealedBlock
+		resultCh <- result
+	}()
+
+	return resultCh
+}
+
+// SubscribeNewSequence subscribes to new sequence events.
+// When a new block sequence starts (not round change), this subscription receives a signal.
+func (sb *backend) SubscribeNewSequence() *event.TypeMuxSubscription {
+	return sb.istanbulEventMux.Subscribe(istanbul.NewSequenceEvent{})
+}

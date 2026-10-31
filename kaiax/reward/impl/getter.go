@@ -1,0 +1,665 @@
+// Copyright 2024 The Kaia Authors
+// This file is part of the Kaia library.
+//
+// The Kaia library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The Kaia library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the Kaia library. If not, see <http://www.gnu.org/licenses/>.
+
+package impl
+
+import (
+	"math/big"
+
+	"github.com/kaiachain/kaia/blockchain/types"
+	"github.com/kaiachain/kaia/common"
+	"github.com/kaiachain/kaia/common/math"
+	"github.com/kaiachain/kaia/kaiax/reward"
+	"github.com/kaiachain/kaia/kaiax/staking"
+	"github.com/kaiachain/kaia/params"
+)
+
+// Below outlines the relationship between the getters and their helper functions.
+//
+// GetRewardSummary
+// - loadBlockData
+// - - getExecFee = F
+// - getRewardSummary = MR + DF + NDF
+//
+// GetBlockReward
+// - loadBlockData
+// - - getExecFee = F
+// - getDeferredReward = MR + DF
+// - specWithNonDeferredFee = MR + DF + NDF
+//
+// GetDeferredReward
+// - getExecFee = F
+// - getDeferredReward = MR + DF
+// - - getDeferredRewardSimple   for istanbul.policy != 2
+// - - getDeferredRewardFull     for istanbul.policy == 2
+// - - - getDeferredRewardFullFlex    for IsKore && UseFlexReward
+// - - - getDeferredRewardFullKore    for IsKore && !UseFlexReward
+// - - - getDeferredRewardFullLegacy  for !IsKore
+// - - - - assignStakingRewards
+// - - - - specWithProposerAndFunds
+
+func (r *RewardModule) GetRewardSummary(num uint64) (*reward.RewardSummary, error) {
+	config, header, execFee, err := r.loadBlockData(num)
+	if err != nil {
+		return nil, err
+	}
+	return getRewardSummary(config, execFee, getBlobFee(header)), nil
+}
+
+func (r *RewardModule) loadBlockData(num uint64) (*reward.RewardConfig, *types.Header, *big.Int, error) {
+	block := r.Chain.GetBlockByNumber(num)
+	if block == nil {
+		return nil, nil, nil, reward.ErrNoBlock
+	}
+	receipts := r.Chain.GetReceiptsByBlockHash(block.Hash())
+	if receipts == nil {
+		return nil, nil, nil, reward.ErrNoReceipts
+	}
+	header := block.Header()
+	txs := block.Transactions()
+
+	config, err := reward.NewRewardConfig(r.ChainConfig, r.GovModule, header)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	execFee, err := getExecFee(config, header, txs, receipts)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	return config, header, execFee, nil
+}
+
+func getRewardSummary(config *reward.RewardConfig, execFee, blobFee *big.Int) *reward.RewardSummary {
+	minted := new(big.Int).Set(config.MintingAmount)
+
+	burntFee := big.NewInt(0)
+	if config.IsSimple { // simplified getDeferredRewardSimple
+		if config.Rules.IsMagma {
+			burntFee = getBurnAmountMagma(execFee)
+		}
+	} else { // simplified getDeferredRewardFull
+		if config.Rules.IsKore {
+			burntFee = getBurnAmountKore(config, execFee)
+		} else if config.Rules.IsMagma {
+			burntFee = getBurnAmountMagma(execFee)
+		}
+	}
+
+	// Blob fees (KIP-279) are 100% burned during state transition per EIP-4844 spec,
+	// in both deferred and non-deferred modes.
+	// They are tracked separately because they must not enter the reward-split calculation.
+	summary := reward.NewRewardSummary()
+	summary.Minted = minted
+	summary.TotalFee = new(big.Int).Add(execFee, blobFee)
+	summary.BurntFee = new(big.Int).Add(burntFee, blobFee)
+	return summary
+}
+
+// getBlobFee returns the total blob fee burned in the block (blobGasUsed * blobBaseFee).
+// Returns zero if the block has no blob transactions.
+func getBlobFee(header *types.Header) *big.Int {
+	if header.BlobGasUsed == nil || *header.BlobGasUsed == 0 {
+		return big.NewInt(0)
+	}
+	blobBaseFee := params.CalcBlobFee(header.BaseFee)
+	if blobBaseFee == nil {
+		return big.NewInt(0)
+	}
+	return new(big.Int).Mul(new(big.Int).SetUint64(*header.BlobGasUsed), blobBaseFee)
+}
+
+func (r *RewardModule) GetBlockReward(num uint64) (*reward.RewardSpec, error) {
+	config, header, execFee, err := r.loadBlockData(num)
+	if err != nil {
+		return nil, err
+	}
+
+	spec, err := r.getDeferredReward(config, header, execFee)
+	if err != nil {
+		return nil, err
+	}
+
+	return r.specWithNonDeferredFee(spec, config, header, execFee)
+}
+
+// specWithNonDeferredFee adds non-deferred fees to the reward spec.
+func (r *RewardModule) specWithNonDeferredFee(spec *reward.RewardSpec, config *reward.RewardConfig, header *types.Header, execFee *big.Int) (*reward.RewardSpec, error) {
+	if config.DeferredTxFee {
+		return spec, nil // nothing to do under deferred mode
+	}
+
+	newSpec := spec.Copy()
+
+	blobFee := getBlobFee(header)
+	if config.Rules.IsMagma {
+		// Half the non-deferred fee is burnt only since Permissionless; see StateTransition.TransitionDb.
+		// The ledger rounds the burn per transaction (TransitionDb) while this rounds the block total, so the
+		// reported burn can exceed the actual one by up to (number of odd-fee transactions)/2 kei.
+		burntFee := big.NewInt(0)
+		if config.Rules.IsPermissionless {
+			burntFee = getBurnAmountMagma(execFee)
+		}
+		distributedFee := new(big.Int).Sub(execFee, burntFee)
+		newSpec.TotalFee.Add(newSpec.TotalFee, new(big.Int).Add(execFee, blobFee))
+		newSpec.BurntFee.Add(newSpec.BurntFee, new(big.Int).Add(burntFee, blobFee))
+		newSpec.Proposer.Add(newSpec.Proposer, distributedFee)
+
+		// Since Magma, non-deferred fees are assigned to header.Rewardbase.
+		newSpec.IncRecipient(config.Rewardbase, distributedFee)
+	} else {
+		distributedFee := new(big.Int).Set(execFee)
+
+		newSpec.TotalFee.Add(newSpec.TotalFee, new(big.Int).Add(execFee, blobFee))
+		newSpec.Proposer.Add(newSpec.Proposer, distributedFee)
+
+		// Before Magma, non-deferred fees are assigned to evm.Coinbase which originates from the block author.
+		coinbase, err := r.Chain.Sealer().Author(header)
+		if err != nil {
+			return nil, err
+		}
+		newSpec.IncRecipient(coinbase, distributedFee)
+	}
+
+	return newSpec, nil
+}
+
+// Under non-deferred mode, transaction fees are ignored.
+func (r *RewardModule) GetDeferredReward(header *types.Header, txs []*types.Transaction, receipts []*types.Receipt) (*reward.RewardSpec, error) {
+	config, err := reward.NewRewardConfig(r.ChainConfig, r.GovModule, header)
+	if err != nil {
+		return nil, err
+	}
+	execFee, err := getExecFee(config, header, txs, receipts)
+	if err != nil {
+		return nil, err
+	}
+
+	return r.getDeferredReward(config, header, execFee)
+}
+
+func (r *RewardModule) getDeferredReward(config *reward.RewardConfig, header *types.Header, execFee *big.Int) (*reward.RewardSpec, error) {
+	blobFee := getBlobFee(header)
+	if config.IsSimple {
+		return getDeferredRewardSimple(config, execFee, blobFee)
+	} else {
+		si, err := r.StakingModule.GetStakingInfo(header.Number.Uint64())
+		if err != nil {
+			return nil, err
+		}
+		if config.Rules.IsPermissionless {
+			if si, err = r.rewardEligibleStakingInfo(header.Number.Uint64(), si); err != nil {
+				return nil, err
+			}
+		}
+		return getDeferredRewardFull(config, execFee, blobFee, si)
+	}
+}
+
+// rewardEligibleStakingInfo narrows si to the nodes reward-eligible at block num. Since
+// Permissionless, StakingInfo(num) holds every AddressBookV2 profile read from the state of num-1,
+// while the reward eligibility follows the node states of num, i.e. the state of num-1 plus the
+// transitions applied for num, the same as the committee of num.
+func (r *RewardModule) rewardEligibleStakingInfo(num uint64, si *staking.StakingInfo) (*staking.StakingInfo, error) {
+	eligible, err := r.ValsetModule.GetRewardEligible(num)
+	if err != nil {
+		return nil, err
+	}
+	return si.FilterNodes(eligible), nil
+}
+
+// getExecFee calculates the total execution gas fees in the block (excludes blob fees).
+func getExecFee(config *reward.RewardConfig, header *types.Header, txs []*types.Transaction, receipts []*types.Receipt) (*big.Int, error) {
+	if config.Rules.IsKaia {
+		// sum { tx[i].gasUsed * tx[i].effectiveGasPrice }
+		// = block.gasUsed * block.baseFeePerGas + sum { tx[i].gasUsed * tx[i].effectiveGasTip }
+		if len(txs) != len(receipts) {
+			return nil, reward.ErrTxReceiptsLenMismatch
+		}
+		execFee := new(big.Int).Mul(new(big.Int).SetUint64(header.GasUsed), header.BaseFee)
+		for i, tx := range txs {
+			tip := new(big.Int).Mul(new(big.Int).SetUint64(receipts[i].GasUsed), tx.EffectiveGasTip(header.BaseFee))
+			execFee = execFee.Add(execFee, tip)
+		}
+		return execFee, nil
+	} else if config.Rules.IsMagma {
+		// Optimized to block.gasUsed * block.baseFeePerGas
+		return new(big.Int).Mul(new(big.Int).SetUint64(header.GasUsed), header.BaseFee), nil
+	} else {
+		// Optimized to block.gasUsed * governance.unitprice
+		return new(big.Int).Mul(new(big.Int).SetUint64(header.GasUsed), config.UnitPrice), nil
+	}
+}
+
+// getDeferredRewardSimple is for Simple policy.
+func getDeferredRewardSimple(config *reward.RewardConfig, execFee, blobFee *big.Int) (*reward.RewardSpec, error) {
+	spec := reward.NewRewardSpec()
+	minted := new(big.Int).Set(config.MintingAmount)
+
+	// Non-deferred mode
+	if !config.DeferredTxFee {
+		var proposer *big.Int
+		if config.Rules.IsMagma {
+			// In non-deferred mode, no fees to distribute here at the end of block processing.
+			// Just distribute the minting reward to the proposer and stop.
+			proposer = new(big.Int).Set(minted)
+			execFee = big.NewInt(0)
+		} else {
+			// But Simple policy had a bug where transaction fees were distributed to the proposer here at the end of block processing
+			// despite configured to non-deferred mode. To keep the backward compatibility, the buggy behavior retains until Magma.
+			proposer = new(big.Int).Add(minted, execFee)
+		}
+		spec.Minted = new(big.Int).Set(minted)
+		// Both exec fees and blob fees are processed during state transition in non-deferred mode,
+		// not at finalization. TotalFee/BurntFee are completed by specWithNonDeferredFee (GetBlockReward only).
+		spec.TotalFee = execFee // Note that we've set it to 0 for non-deferred + Magma (see above).
+		spec.BurntFee = big.NewInt(0)
+		spec.Proposer = proposer
+		spec.IncRecipient(config.Rewardbase, proposer)
+		return spec, nil
+	}
+
+	// Deferred mode
+	burntFee := big.NewInt(0)
+	if config.Rules.IsMagma {
+		burntFee = getBurnAmountMagma(execFee)
+	}
+	proposer := new(big.Int).Add(minted, execFee)
+	proposer.Sub(proposer, burntFee)
+
+	spec.Minted = minted
+	spec.TotalFee = new(big.Int).Add(execFee, blobFee)
+	spec.BurntFee = new(big.Int).Add(burntFee, blobFee)
+	spec.Proposer = proposer
+	spec.IncRecipient(config.Rewardbase, proposer)
+	return spec, nil
+}
+
+// getDeferredRewardFull is for non-Simple policy.
+func getDeferredRewardFull(config *reward.RewardConfig, execFee, blobFee *big.Int, si *staking.StakingInfo) (*reward.RewardSpec, error) {
+	// Non-deferred and deferred modes share most of the logic
+	// except that in non-deferred mode all fees (exec and blob) are processed during state transition,
+	// not at finalization. TotalFee/BurntFee are completed by specWithNonDeferredFee (GetBlockReward only).
+	var burntFee *big.Int
+	if !config.DeferredTxFee {
+		execFee = big.NewInt(0)
+		blobFee = big.NewInt(0)
+		burntFee = big.NewInt(0)
+	} else {
+		if config.Rules.IsKore {
+			burntFee = getBurnAmountKore(config, execFee)
+		} else if config.Rules.IsMagma {
+			burntFee = getBurnAmountMagma(execFee)
+		} else {
+			burntFee = big.NewInt(0)
+		}
+	}
+
+	// Both non-deferred and deferred modes
+	if config.Rules.IsOsaka && config.UseFlexReward {
+		return getDeferredRewardFullFlex(config, execFee, burntFee, blobFee, si)
+	} else if config.Rules.IsKore {
+		return getDeferredRewardFullKore(config, execFee, burntFee, blobFee, si)
+	} else {
+		// Legacy is pre-Kore, which predates Osaka. blobFee is always zero here.
+		return getDeferredRewardFullLegacy(config, execFee, burntFee, si)
+	}
+}
+
+// getDeferredRewardFullFlex is for non-Simple policy, after Kore, and with UseFlexReward enabled.
+func getDeferredRewardFullFlex(config *reward.RewardConfig, execFee, burntFee, blobFee *big.Int, si *staking.StakingInfo) (*reward.RewardSpec, error) {
+	var (
+		spec             = reward.NewRewardSpec()
+		minted           = new(big.Int).Set(config.MintingAmount)
+		distributableFee = new(big.Int).Sub(execFee, burntFee)
+	)
+
+	// Distribute using RewardRatio (4-part) first. Unlike Legacy, fees are not distributed here
+	// because fees are exclusively allocated to proposer. By the way, remainder goes to KIF.
+	validators, kif, kef, kpf := config.RewardRatio.SplitFlex(minted)
+	proposer, stakers := config.Kip82Ratio.Split(validators)
+	ratioRemainder := calcRemainder(minted, proposer, stakers, kif, kef, kpf)
+	kif.Add(kif, ratioRemainder)
+
+	// Further distribute using Kip82Ratio. By the way, remainder goes to proposer.
+	stakersAlloc, kip82Remainder := assignStakingRewardsFlex(config, stakers, si)
+	proposer.Add(proposer, kip82Remainder)
+	stakers.Sub(stakers, kip82Remainder)
+
+	// Proposer gets the fees.
+	proposer.Add(proposer, distributableFee)
+
+	spec.Minted = minted
+	spec.TotalFee = new(big.Int).Add(execFee, blobFee)
+	spec.BurntFee = new(big.Int).Add(burntFee, blobFee)
+	spec.Stakers = stakers
+	for addr, amount := range stakersAlloc {
+		spec.IncRecipient(addr, amount)
+	}
+
+	spec = specWithProposerAndFundsFlex(spec, config, proposer, kif, kef, kpf, si)
+	return spec, nil
+}
+
+// getDeferredRewardFullKore is for non-Simple policy and after Kore.
+func getDeferredRewardFullKore(config *reward.RewardConfig, execFee, burntFee, blobFee *big.Int, si *staking.StakingInfo) (*reward.RewardSpec, error) {
+	var (
+		spec             = reward.NewRewardSpec()
+		minted           = new(big.Int).Set(config.MintingAmount)
+		distributableFee = new(big.Int).Sub(execFee, burntFee)
+	)
+
+	// Distribute using RewardRatio first. Unlike Legacy, fees are not distributed here
+	// because fees are exclusively allocated to proposer. By the way, remainder goes to KIF.
+	validators, kif, kef := config.RewardRatio.Split(minted)
+	proposer, stakers := config.Kip82Ratio.Split(validators)
+	ratioRemainder := calcRemainder(minted, proposer, stakers, kif, kef)
+	kif.Add(kif, ratioRemainder)
+
+	// Further distribute using Kip82Ratio. By the way, remainder goes to proposer.
+	// After Prague, if the CLStaking is not nil, the proposer and staking rewards are proportionally distributed to both CN and CL.
+	// For proposer rewards, see `specWithProposerAndFunds`.
+	stakersAlloc, kip82Remainder := assignStakingRewards(config, stakers, si)
+	proposer.Add(proposer, kip82Remainder)
+	stakers.Sub(stakers, kip82Remainder)
+
+	// Proposer gets the fees.
+	proposer.Add(proposer, distributableFee)
+
+	spec.Minted = minted
+	spec.TotalFee = new(big.Int).Add(execFee, blobFee)
+	spec.BurntFee = new(big.Int).Add(burntFee, blobFee)
+	spec.Stakers = stakers
+	for addr, amount := range stakersAlloc {
+		spec.IncRecipient(addr, amount)
+	}
+	spec = specWithProposerAndFunds(spec, config, proposer, kif, kef, si)
+	return spec, nil
+}
+
+// getDeferredRewardFullLegacy is for non-Simple policy and before Kore.
+func getDeferredRewardFullLegacy(config *reward.RewardConfig, execFee, burntFee *big.Int, si *staking.StakingInfo) (*reward.RewardSpec, error) {
+	var (
+		spec             = reward.NewRewardSpec()
+		minted           = new(big.Int).Set(config.MintingAmount)
+		distributableFee = new(big.Int).Sub(execFee, burntFee)
+		totalReward      = new(big.Int).Add(minted, distributableFee)
+	)
+
+	// Distribute using RewardRatio. Remainder goes to KIF.
+	proposer, kif, kef := config.RewardRatio.Split(totalReward)
+	ratioRemainder := calcRemainder(totalReward, proposer, kif, kef)
+	kif.Add(kif, ratioRemainder)
+
+	spec.Minted = minted
+	spec.TotalFee = execFee
+	spec.BurntFee = burntFee
+	spec.Stakers = common.Big0 // No stakers reward before Kore
+	spec = specWithProposerAndFunds(spec, config, proposer, kif, kef, si)
+	return spec, nil
+}
+
+// getBurnAmountMagma returns the amount of fees to be burnt by Magma.
+func getBurnAmountMagma(execFee *big.Int) *big.Int {
+	return new(big.Int).Div(execFee, big.NewInt(2))
+}
+
+// getBurnAmountKore returns the amount of fees to be burnt by Kore.
+// This includes Magma burnt amount (half of the total fee).
+func getBurnAmountKore(config *reward.RewardConfig, execFee *big.Int) *big.Int {
+	firstHalf := new(big.Int).Div(execFee, big.NewInt(2))
+	secondHalf := new(big.Int).Sub(execFee, firstHalf)
+
+	validatorMintingReward, _, _ := config.RewardRatio.Split(config.MintingAmount)
+	proposerMintingReward, _ := config.Kip82Ratio.Split(validatorMintingReward)
+
+	return new(big.Int).Add(
+		firstHalf, // half the fee is always burnt
+		math.BigMin(secondHalf, proposerMintingReward), // the rest is burnt up to the proposer's minting reward
+	)
+}
+
+// calcRemainder returns total - sum(parts).
+func calcRemainder(total *big.Int, parts ...*big.Int) *big.Int {
+	remaining := new(big.Int).Set(total)
+	for _, part := range parts {
+		remaining.Sub(remaining, part)
+	}
+	return remaining
+}
+
+// assignStakingRewardsFlex assigns staking rewards to stakers according to their staking amounts.
+// Returns the allocation and the remainder.
+func assignStakingRewardsFlex(config *reward.RewardConfig, budget *big.Int, si *staking.StakingInfo) (map[common.Address]*big.Int, *big.Int) {
+	var (
+		minStake  = config.MinimumStake.Uint64()
+		threshold = config.StakingRewardThreshold.Uint64()
+		isPrague  = config.Rules.IsPrague
+
+		cns            = si.ConsolidatedNodes()
+		excessInt      = make(map[common.Address]uint64)
+		totalExcessInt = uint64(0)
+	)
+
+	// Calculate the excess stakes (the amount over the threshold) for each CN.
+	for _, cn := range cns {
+		// If the CNStaking is less than minStake, skip it. Even if (CNStaking + CLStaking) could be more than minStake,
+		// the CNStaking alone must be at least minStake to be eligible.
+		if cn.StakingAmount < minStake {
+			continue
+		}
+
+		amount := cn.StakingAmount
+		if isPrague && cn.CLStakingInfo != nil {
+			amount += cn.CLStakingInfo.CLStakingAmount
+		}
+
+		// Excess is the amount over the threshold (not over minStake).
+		if amount > threshold {
+			excessInt[cn.RewardAddr] = amount - threshold
+			totalExcessInt += excessInt[cn.RewardAddr]
+		}
+	}
+
+	// Distribute the budget to the CNs based on the excess stakes.
+	var (
+		totalExcess = new(big.Int).SetUint64(totalExcessInt)
+		remaining   = new(big.Int).Set(budget)
+		alloc       = make(map[common.Address]*big.Int)
+	)
+	for _, cn := range cns {
+		if excessInt[cn.RewardAddr] <= 0 {
+			continue
+		}
+		excess := new(big.Int).SetUint64(excessInt[cn.RewardAddr])
+
+		// The KAIA unit will cancel out:
+		// reward (kei) = excess (KAIA) * budget (kei) / totalExcess (KAIA)
+		reward := new(big.Int).Div(new(big.Int).Mul(excess, budget), totalExcess)
+		if reward.Sign() <= 0 {
+			continue
+		}
+
+		// If Prague and CL is configured for this CN, split the reward between CN and CL.
+		if isPrague && cn.CLStakingInfo != nil {
+			cnAmount, clAmount := cn.Split(reward)
+			alloc[cn.RewardAddr] = cnAmount
+			alloc[cn.CLStakingInfo.CLPoolAddr] = clAmount
+		} else {
+			alloc[cn.RewardAddr] = reward
+		}
+		remaining.Sub(remaining, reward)
+	}
+	return alloc, remaining
+}
+
+// assignStakingRewards assigns staking rewards to stakers according to their staking amounts.
+// Returns the allocation and the remainder.
+func assignStakingRewards(config *reward.RewardConfig, stakersReward *big.Int, si *staking.StakingInfo) (map[common.Address]*big.Int, *big.Int) {
+	var (
+		cns               = si.ConsolidatedNodes()
+		minStake          = config.MinimumStake.Uint64()
+		totalExcessInt    = uint64(0) // sum of excess stakes (the amount over minStake) over all stakers
+		cnTotalStakingMap = make(map[common.Address]uint64)
+		isPrague          = config.Rules.IsPrague
+	)
+	for _, cn := range cns {
+		// If the CNStaking is less than minStake, skip it.
+		if cn.StakingAmount >= minStake {
+			// Calculate total staking amount once
+			cnTotalStakingAmount := cn.StakingAmount
+			if isPrague && cn.CLStakingInfo != nil {
+				cnTotalStakingAmount += cn.CLStakingInfo.CLStakingAmount
+			}
+			totalExcessInt += cnTotalStakingAmount - minStake
+			cnTotalStakingMap[cn.RewardAddr] = cnTotalStakingAmount
+		}
+	}
+
+	var (
+		totalExcess = new(big.Int).SetUint64(totalExcessInt)
+		remaining   = new(big.Int).Set(stakersReward)
+		alloc       = make(map[common.Address]*big.Int)
+	)
+	for _, cn := range cns {
+		cnTotalStakingAmount := cnTotalStakingMap[cn.RewardAddr]
+		if cnTotalStakingAmount > minStake {
+			// The KAIA unit will cancel out:
+			// reward (kei) = excess (KAIA) * stakersReward (kei) / totalExcess (KAIA)
+			excess := new(big.Int).SetUint64(cnTotalStakingAmount - minStake)
+			if reward := new(big.Int).Div(new(big.Int).Mul(excess, stakersReward), totalExcess); reward.Sign() > 0 {
+				if isPrague && cn.CLStakingInfo != nil {
+					// The remaining amount will be added to the cnAmount.
+					cnAmount, clAmount := cn.Split(reward)
+					alloc[cn.RewardAddr] = cnAmount
+					alloc[cn.CLStakingInfo.CLPoolAddr] = clAmount
+				} else {
+					alloc[cn.RewardAddr] = reward
+				}
+				remaining.Sub(remaining, reward)
+			}
+		}
+	}
+	return alloc, remaining
+}
+
+// specWithProposerAndFundsFlex assigns proposer, kif, kef, kpf to the reward spec.
+// This must be the last step of building the RewardSpec as it finalizes the Proposer, KEF, KIF fields.
+func specWithProposerAndFundsFlex(spec *reward.RewardSpec, config *reward.RewardConfig, proposer, kif, kef, kpf *big.Int, si *staking.StakingInfo) *reward.RewardSpec {
+	newSpec := spec.Copy()
+
+	// If KIF, KEF, or KPF address is not set, proposer takes it.
+	if common.EmptyAddress(si.KIFAddr) {
+		newSpec.KIF = common.Big0
+		proposer.Add(proposer, kif)
+	} else {
+		newSpec.KIF = kif
+		newSpec.IncRecipient(si.KIFAddr, kif)
+	}
+
+	if common.EmptyAddress(si.KEFAddr) {
+		newSpec.KEF = common.Big0
+		proposer.Add(proposer, kef)
+	} else {
+		newSpec.KEF = kef
+		newSpec.IncRecipient(si.KEFAddr, kef)
+	}
+
+	if common.EmptyAddress(si.KPFAddr) {
+		newSpec.KPF = common.Big0
+		proposer.Add(proposer, kpf)
+	} else {
+		newSpec.KPF = kpf
+		newSpec.IncRecipient(si.KPFAddr, kpf)
+	}
+
+	newSpec.Proposer = proposer
+	if !config.Rules.IsPrague || si.CLStakingInfos == nil {
+		newSpec.IncRecipient(config.Rewardbase, proposer)
+		return newSpec
+	}
+
+	// Handle CLStakingInfo for proposer after Prague
+	cns := si.ConsolidatedNodes()
+	for _, cn := range cns {
+		if cn.RewardAddr != config.Rewardbase {
+			continue
+		}
+		if cn.CLStakingInfo == nil {
+			// Early exit if there's no CL for proposer
+			break
+		}
+
+		cnAmount, clAmount := cn.Split(proposer)
+
+		newSpec.IncRecipient(cn.RewardAddr, cnAmount)
+		newSpec.IncRecipient(cn.CLStakingInfo.CLPoolAddr, clAmount)
+		return newSpec
+	}
+
+	newSpec.IncRecipient(config.Rewardbase, proposer)
+	return newSpec
+}
+
+// specWithProposerAndFunds assigns proposer, kif, kef to the reward spec.
+// This must be the last step of building the RewardSpec as it finalizes the Proposer, KEF, KIF fields.
+func specWithProposerAndFunds(spec *reward.RewardSpec, config *reward.RewardConfig, proposer, kif, kef *big.Int, si *staking.StakingInfo) *reward.RewardSpec {
+	newSpec := spec.Copy()
+
+	// If KIF or KEF address is not set, proposer takes it.
+	if common.EmptyAddress(si.KIFAddr) {
+		newSpec.KIF = common.Big0
+		proposer.Add(proposer, kif)
+	} else {
+		newSpec.KIF = kif
+		newSpec.IncRecipient(si.KIFAddr, kif)
+	}
+
+	if common.EmptyAddress(si.KEFAddr) {
+		newSpec.KEF = common.Big0
+		proposer.Add(proposer, kef)
+	} else {
+		newSpec.KEF = kef
+		newSpec.IncRecipient(si.KEFAddr, kef)
+	}
+
+	newSpec.Proposer = proposer
+	if !config.Rules.IsPrague || si.CLStakingInfos == nil {
+		newSpec.IncRecipient(config.Rewardbase, proposer)
+		return newSpec
+	}
+
+	// Handle CLStakingInfo for proposer after Prague
+	cns := si.ConsolidatedNodes()
+	for _, cn := range cns {
+		if cn.RewardAddr != config.Rewardbase {
+			continue
+		}
+		if cn.CLStakingInfo == nil {
+			// Early exit if there's no CL for proposer
+			break
+		}
+
+		cnAmount, clAmount := cn.Split(proposer)
+
+		newSpec.IncRecipient(cn.RewardAddr, cnAmount)
+		newSpec.IncRecipient(cn.CLStakingInfo.CLPoolAddr, clAmount)
+		return newSpec
+	}
+
+	newSpec.IncRecipient(config.Rewardbase, proposer)
+	return newSpec
+}

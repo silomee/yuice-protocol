@@ -1,0 +1,392 @@
+// Modifications Copyright 2024 The Kaia Authors
+// Copyright 2019 The klaytn Authors
+// This file is part of the klaytn library.
+//
+// The klaytn library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The klaytn library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the klaytn library. If not, see <http://www.gnu.org/licenses/>.
+// Modified and improved for the Kaia development.
+
+package types
+
+import (
+	"encoding/json"
+	"io"
+	"math/big"
+
+	"github.com/kaiachain/kaia/blockchain/types/accountkey"
+	"github.com/kaiachain/kaia/common"
+	"github.com/kaiachain/kaia/common/hexutil"
+	"github.com/kaiachain/kaia/kerrors"
+	"github.com/kaiachain/kaia/rlp"
+)
+
+// TxInternalDataAccountCreation represents a transaction creating an account.
+type TxInternalDataAccountCreation struct {
+	AccountNonce  uint64
+	Price         *big.Int
+	GasLimit      uint64
+	Recipient     common.Address
+	Amount        *big.Int
+	From          common.Address
+	HumanReadable bool
+	Key           accountkey.AccountKey
+
+	TxSignatures
+
+	// This is only used when marshaling to JSON.
+	Hash *common.Hash `json:"hash" rlp:"-"`
+}
+
+type TxInternalDataAccountCreationJSON struct {
+	Type          TxType           `json:"typeInt"`
+	TypeStr       string           `json:"type"`
+	AccountNonce  hexutil.Uint64   `json:"nonce"`
+	Price         *hexutil.Big     `json:"gasPrice"`
+	GasLimit      hexutil.Uint64   `json:"gas"`
+	Recipient     common.Address   `json:"to"`
+	Amount        *hexutil.Big     `json:"value"`
+	From          common.Address   `json:"from"`
+	HumanReadable bool             `json:"humanReadable"`
+	Key           hexutil.Bytes    `json:"key"`
+	TxSignatures  TxSignaturesJSON `json:"signatures"`
+	Hash          *common.Hash     `json:"hash"`
+}
+
+// txInternalDataAccountCreationSerializable for RLP serialization.
+type txInternalDataAccountCreationSerializable struct {
+	AccountNonce  uint64
+	Price         *big.Int
+	GasLimit      uint64
+	Recipient     common.Address
+	Amount        *big.Int
+	From          common.Address
+	HumanReadable bool
+	KeyData       []byte
+
+	TxSignatures
+}
+
+func newTxInternalDataAccountCreation() *TxInternalDataAccountCreation {
+	h := common.Hash{}
+	return &TxInternalDataAccountCreation{
+		Price:  new(big.Int),
+		Amount: new(big.Int),
+		Key:    accountkey.NewAccountKeyLegacy(),
+		Hash:   &h,
+	}
+}
+
+func newTxInternalDataAccountCreationWithMap(values map[TxValueKeyType]interface{}) (*TxInternalDataAccountCreation, error) {
+	b := newTxInternalDataAccountCreation()
+
+	if v, ok := values[TxValueKeyNonce].(uint64); ok {
+		b.AccountNonce = v
+		delete(values, TxValueKeyNonce)
+	} else {
+		return nil, errValueKeyNonceMustUint64
+	}
+
+	if v, ok := values[TxValueKeyGasPrice].(*big.Int); ok {
+		b.Price.Set(v)
+		delete(values, TxValueKeyGasPrice)
+	} else {
+		return nil, errValueKeyGasPriceMustBigInt
+	}
+
+	if v, ok := values[TxValueKeyGasLimit].(uint64); ok {
+		b.GasLimit = v
+		delete(values, TxValueKeyGasLimit)
+	} else {
+		return nil, errValueKeyGasLimitMustUint64
+	}
+
+	if v, ok := values[TxValueKeyTo].(common.Address); ok {
+		b.Recipient = v
+		delete(values, TxValueKeyTo)
+	} else {
+		return nil, errValueKeyToMustAddress
+	}
+
+	if v, ok := values[TxValueKeyAmount].(*big.Int); ok {
+		b.Amount.Set(v)
+		delete(values, TxValueKeyAmount)
+	} else {
+		return nil, errValueKeyAmountMustBigInt
+	}
+
+	if v, ok := values[TxValueKeyFrom].(common.Address); ok {
+		b.From = v
+		delete(values, TxValueKeyFrom)
+	} else {
+		return nil, errValueKeyFromMustAddress
+	}
+
+	if v, ok := values[TxValueKeyHumanReadable].(bool); ok {
+		b.HumanReadable = v
+		delete(values, TxValueKeyHumanReadable)
+	} else {
+		return nil, errValueKeyHumanReadableMustBool
+	}
+
+	if v, ok := values[TxValueKeyAccountKey].(accountkey.AccountKey); ok {
+		b.Key = v
+		delete(values, TxValueKeyAccountKey)
+	} else {
+		return nil, errValueKeyAccountKeyMustAccountKey
+	}
+
+	if len(values) != 0 {
+		for k := range values {
+			logger.Warn("unnecessary key", k.String())
+		}
+		return nil, errUndefinedKeyRemains
+	}
+
+	return b, nil
+}
+
+func newTxInternalDataAccountCreationSerializable() *txInternalDataAccountCreationSerializable {
+	return &txInternalDataAccountCreationSerializable{}
+}
+
+func (t *TxInternalDataAccountCreation) toSerializable() *txInternalDataAccountCreationSerializable {
+	serializer := accountkey.NewAccountKeySerializerWithAccountKey(t.Key)
+	keyEnc, _ := rlp.EncodeToBytes(serializer)
+
+	return &txInternalDataAccountCreationSerializable{
+		t.AccountNonce,
+		t.Price,
+		t.GasLimit,
+		t.Recipient,
+		t.Amount,
+		t.From,
+		t.HumanReadable,
+		keyEnc,
+		t.TxSignatures,
+	}
+}
+
+func (t *TxInternalDataAccountCreation) fromSerializable(serialized *txInternalDataAccountCreationSerializable) error {
+	t.AccountNonce = serialized.AccountNonce
+	t.Price = serialized.Price
+	t.GasLimit = serialized.GasLimit
+	t.Recipient = serialized.Recipient
+	t.Amount = serialized.Amount
+	t.From = serialized.From
+	t.HumanReadable = serialized.HumanReadable
+	t.TxSignatures = serialized.TxSignatures
+
+	serializer := accountkey.NewAccountKeySerializer()
+	if err := rlp.DecodeBytes(serialized.KeyData, serializer); err != nil {
+		return err
+	}
+	t.Key = serializer.GetKey()
+
+	return nil
+}
+
+func (t *TxInternalDataAccountCreation) EncodeRLP(w io.Writer) error {
+	return rlp.Encode(w, t.toSerializable())
+}
+
+func (t *TxInternalDataAccountCreation) DecodeRLP(s *rlp.Stream) error {
+	dec := newTxInternalDataAccountCreationSerializable()
+
+	if err := s.Decode(dec); err != nil {
+		return err
+	}
+	if err := t.fromSerializable(dec); err != nil {
+		logger.Warn("DecodeRLP failed", "err", err)
+		return kerrors.ErrUnserializableKey
+	}
+
+	return nil
+}
+
+func (t *TxInternalDataAccountCreation) MarshalJSON() ([]byte, error) {
+	serializer := accountkey.NewAccountKeySerializerWithAccountKey(t.Key)
+	keyEnc, _ := rlp.EncodeToBytes(serializer)
+
+	return json.Marshal(TxInternalDataAccountCreationJSON{
+		t.Type(),
+		t.Type().String(),
+		(hexutil.Uint64)(t.AccountNonce),
+		(*hexutil.Big)(t.Price),
+		(hexutil.Uint64)(t.GasLimit),
+		t.Recipient,
+		(*hexutil.Big)(t.Amount),
+		t.From,
+		t.HumanReadable,
+		(hexutil.Bytes)(keyEnc),
+		t.TxSignatures.ToJSON(),
+		t.Hash,
+	})
+}
+
+func (t *TxInternalDataAccountCreation) UnmarshalJSON(b []byte) error {
+	js := &TxInternalDataAccountCreationJSON{}
+	if err := json.Unmarshal(b, js); err != nil {
+		return err
+	}
+
+	ser := accountkey.NewAccountKeySerializer()
+	if err := rlp.DecodeBytes(js.Key, ser); err != nil {
+		logger.Warn("UnmarshalJSON failed", "err", err)
+		return kerrors.ErrUnserializableKey
+	}
+
+	t.AccountNonce = uint64(js.AccountNonce)
+	t.Price = (*big.Int)(js.Price)
+	t.GasLimit = uint64(js.GasLimit)
+	t.Recipient = js.Recipient
+	t.Amount = (*big.Int)(js.Amount)
+	t.From = js.From
+	t.HumanReadable = js.HumanReadable
+	t.Key = ser.GetKey()
+	t.TxSignatures = js.TxSignatures.ToTxSignatures()
+	t.Hash = js.Hash
+
+	return nil
+}
+
+func (t *TxInternalDataAccountCreation) Type() TxType {
+	return TxTypeAccountCreation
+}
+
+func (t *TxInternalDataAccountCreation) GetRoleTypeForValidation() accountkey.RoleType {
+	return accountkey.RoleTransaction
+}
+
+func (t *TxInternalDataAccountCreation) GetNonce() uint64 {
+	return t.AccountNonce
+}
+
+func (t *TxInternalDataAccountCreation) GetGasPrice() *big.Int {
+	return new(big.Int).Set(t.Price)
+}
+
+func (t *TxInternalDataAccountCreation) GetGasLimit() uint64 {
+	return t.GasLimit
+}
+
+func (t *TxInternalDataAccountCreation) GetTo() *common.Address {
+	if t.Recipient == (common.Address{}) {
+		return nil
+	}
+
+	to := common.Address(t.Recipient)
+	return &to
+}
+
+func (t *TxInternalDataAccountCreation) GetValue() *big.Int {
+	return new(big.Int).Set(t.Amount)
+}
+
+func (t *TxInternalDataAccountCreation) GetFrom() common.Address {
+	return t.From
+}
+
+func (t *TxInternalDataAccountCreation) GetData() []byte {
+	return []byte{}
+}
+
+func (t *TxInternalDataAccountCreation) setHashForMarshaling(h *common.Hash) {
+	t.Hash = h
+}
+
+func (t *TxInternalDataAccountCreation) SetSignature(s TxSignatures) error {
+	t.TxSignatures = s
+	return nil
+}
+
+func (t *TxInternalDataAccountCreation) IntrinsicGas(currentBlockNumber uint64) (uint64, error) {
+	return GetTxGasForTxTypeWithAccountKey(t.Type(), t.Key, currentBlockNumber, t.HumanReadable)
+}
+
+func (t *TxInternalDataAccountCreation) SerializeForSignToBytes() []byte {
+	serializer := accountkey.NewAccountKeySerializerWithAccountKey(t.Key)
+	keyEnc, _ := rlp.EncodeToBytes(serializer)
+
+	b, _ := rlp.EncodeToBytes(struct {
+		Txtype        TxType
+		AccountNonce  uint64
+		Price         *big.Int
+		GasLimit      uint64
+		Recipient     common.Address
+		Amount        *big.Int
+		From          common.Address
+		HumanReadable bool
+		Key           []byte
+	}{
+		t.Type(),
+		t.AccountNonce,
+		t.Price,
+		t.GasLimit,
+		t.Recipient,
+		t.Amount,
+		t.From,
+		t.HumanReadable,
+		keyEnc,
+	})
+
+	return b
+}
+
+func (t *TxInternalDataAccountCreation) SigHash(chainId *big.Int) common.Hash {
+	return sigHashKaia(t.SerializeForSignToBytes(), chainId)
+}
+
+func (t *TxInternalDataAccountCreation) Validate(stateDB StateDB, currentBlockNumber uint64, checkOnlyMutableValue bool) error {
+	return errUndefinedTxType
+	// if !checkOnlyMutableValue {
+	// 	if t.HumanReadable {
+	// 		return kerrors.ErrHumanReadableNotSupported
+	// 	}
+	// 	if common.IsPrecompiledContractAddress(t.Recipient, fork.Rules(big.NewInt(int64(currentBlockNumber)))) {
+	// 		return kerrors.ErrPrecompiledContractAddress
+	// 	}
+	// 	if err := t.Key.CheckInstallable(currentBlockNumber); err != nil {
+	// 		return err
+	// 	}
+	// }
+	//
+	// Fail if the address is already created.
+	// if stateDB.Exist(t.Recipient) {
+	// 	return kerrors.ErrAccountAlreadyExists
+	// }
+	//return nil
+}
+func (t *TxInternalDataAccountCreation) Execute(sender ContractRef, vm VM, stateDB StateDB, currentBlockNumber uint64, gas uint64, value *big.Int) (ret []byte, usedGas uint64, err error) {
+	to := t.Recipient
+	stateDB.IncNonce(sender.Address())
+	stateDB.CreateEOA(to, t.HumanReadable, t.Key)
+	return vm.Call(sender, to, []byte{}, gas, value)
+}
+
+func (t *TxInternalDataAccountCreation) MakeRPCOutput() map[string]interface{} {
+	serializer := accountkey.NewAccountKeySerializerWithAccountKey(t.Key)
+	keyEnc, _ := rlp.EncodeToBytes(serializer)
+
+	return map[string]interface{}{
+		"typeInt":       t.Type(),
+		"type":          t.Type().String(),
+		"gas":           hexutil.Uint64(t.GasLimit),
+		"gasPrice":      (*hexutil.Big)(t.Price),
+		"nonce":         hexutil.Uint64(t.AccountNonce),
+		"to":            t.Recipient,
+		"value":         (*hexutil.Big)(t.Amount),
+		"humanReadable": t.HumanReadable,
+		"key":           hexutil.Bytes(keyEnc),
+		"signatures":    t.TxSignatures.ToJSON(),
+	}
+}

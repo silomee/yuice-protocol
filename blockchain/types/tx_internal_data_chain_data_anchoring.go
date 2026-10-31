@@ -1,0 +1,262 @@
+// Modifications Copyright 2024 The Kaia Authors
+// Copyright 2019 The klaytn Authors
+// This file is part of the klaytn library.
+//
+// The klaytn library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The klaytn library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the klaytn library. If not, see <http://www.gnu.org/licenses/>.
+// Modified and improved for the Kaia development.
+
+package types
+
+import (
+	"encoding/json"
+	"math/big"
+
+	"github.com/kaiachain/kaia/blockchain/types/accountkey"
+	"github.com/kaiachain/kaia/common"
+	"github.com/kaiachain/kaia/common/hexutil"
+	"github.com/kaiachain/kaia/fork"
+	"github.com/kaiachain/kaia/rlp"
+)
+
+// TxInternalDataChainDataAnchoring represents the transaction anchoring child chain data.
+type TxInternalDataChainDataAnchoring struct {
+	AccountNonce uint64
+	Price        *big.Int
+	GasLimit     uint64
+	From         common.Address
+	Payload      []byte
+
+	TxSignatures
+
+	// This is only used when marshaling to JSON.
+	Hash *common.Hash `json:"hash" rlp:"-"`
+}
+
+type TxInternalDataChainDataAnchoringJSON struct {
+	Type         TxType           `json:"typeInt"`
+	TypeStr      string           `json:"type"`
+	AccountNonce hexutil.Uint64   `json:"nonce"`
+	Price        *hexutil.Big     `json:"gasPrice"`
+	GasLimit     hexutil.Uint64   `json:"gas"`
+	From         common.Address   `json:"from"`
+	Payload      hexutil.Bytes    `json:"input"`
+	InputJson    interface{}      `json:"inputJSON"`
+	TxSignatures TxSignaturesJSON `json:"signatures"`
+	Hash         *common.Hash     `json:"hash"`
+}
+
+func newTxInternalDataChainDataAnchoring() *TxInternalDataChainDataAnchoring {
+	h := common.Hash{}
+
+	return &TxInternalDataChainDataAnchoring{
+		Price: new(big.Int),
+		Hash:  &h,
+	}
+}
+
+func newTxInternalDataChainDataAnchoringWithMap(values map[TxValueKeyType]interface{}) (*TxInternalDataChainDataAnchoring, error) {
+	d := newTxInternalDataChainDataAnchoring()
+
+	if v, ok := values[TxValueKeyNonce].(uint64); ok {
+		d.AccountNonce = v
+		delete(values, TxValueKeyNonce)
+	} else {
+		return nil, errValueKeyNonceMustUint64
+	}
+
+	if v, ok := values[TxValueKeyGasPrice].(*big.Int); ok {
+		d.Price.Set(v)
+		delete(values, TxValueKeyGasPrice)
+	} else {
+		return nil, errValueKeyGasPriceMustBigInt
+	}
+
+	if v, ok := values[TxValueKeyGasLimit].(uint64); ok {
+		d.GasLimit = v
+		delete(values, TxValueKeyGasLimit)
+	} else {
+		return nil, errValueKeyGasLimitMustUint64
+	}
+
+	if v, ok := values[TxValueKeyFrom].(common.Address); ok {
+		d.From = v
+		delete(values, TxValueKeyFrom)
+	} else {
+		return nil, errValueKeyFromMustAddress
+	}
+
+	if v, ok := values[TxValueKeyAnchoredData].([]byte); ok {
+		d.Payload = v
+		delete(values, TxValueKeyAnchoredData)
+	} else {
+		return nil, errValueKeyAnchoredDataMustByteSlice
+	}
+
+	if len(values) != 0 {
+		for k := range values {
+			logger.Warn("unnecessary key", k.String())
+		}
+		return nil, errUndefinedKeyRemains
+	}
+
+	return d, nil
+}
+
+func (t *TxInternalDataChainDataAnchoring) Type() TxType {
+	return TxTypeChainDataAnchoring
+}
+
+func (t *TxInternalDataChainDataAnchoring) GetRoleTypeForValidation() accountkey.RoleType {
+	return accountkey.RoleTransaction
+}
+
+func (t *TxInternalDataChainDataAnchoring) SerializeForSignToBytes() []byte {
+	b, _ := rlp.EncodeToBytes(struct {
+		Txtype       TxType
+		AccountNonce uint64
+		Price        *big.Int
+		GasLimit     uint64
+		From         common.Address
+		AnchoredData []byte
+	}{
+		t.Type(),
+		t.AccountNonce,
+		t.Price,
+		t.GasLimit,
+		t.From,
+		t.Payload,
+	})
+
+	return b
+}
+
+func (t *TxInternalDataChainDataAnchoring) SigHash(chainId *big.Int) common.Hash {
+	return sigHashKaia(t.SerializeForSignToBytes(), chainId)
+}
+
+func (t *TxInternalDataChainDataAnchoring) GetNonce() uint64 {
+	return t.AccountNonce
+}
+
+func (t *TxInternalDataChainDataAnchoring) GetGasPrice() *big.Int {
+	return new(big.Int).Set(t.Price)
+}
+
+func (t *TxInternalDataChainDataAnchoring) GetGasLimit() uint64 {
+	return t.GasLimit
+}
+
+func (t *TxInternalDataChainDataAnchoring) GetTo() *common.Address {
+	return nil
+}
+
+func (t *TxInternalDataChainDataAnchoring) GetValue() *big.Int {
+	return common.Big0
+}
+
+func (t *TxInternalDataChainDataAnchoring) GetFrom() common.Address {
+	return t.From
+}
+
+func (t *TxInternalDataChainDataAnchoring) GetData() []byte {
+	return t.Payload
+}
+
+func (t *TxInternalDataChainDataAnchoring) setHashForMarshaling(h *common.Hash) {
+	t.Hash = h
+}
+
+func (t *TxInternalDataChainDataAnchoring) SetSignature(s TxSignatures) error {
+	t.TxSignatures = s
+	return nil
+}
+
+func (t *TxInternalDataChainDataAnchoring) IntrinsicGas(currentBlockNumber uint64) (uint64, error) {
+	gas, err := GetTxGasForTxTypeWithAccountKey(t.Type(), nil, currentBlockNumber, false)
+	if err != nil {
+		return 0, err
+	}
+
+	// ChainDataAnchoring does not have Recipient, but it is not contract deployment transaction type.
+	// So, isContractCreation is explicitly set as false.
+	gasPayloadWithGas, err := IntrinsicGasPayload(gas, t.Payload, false, *fork.Rules(big.NewInt(int64(currentBlockNumber))))
+	if err != nil {
+		return 0, err
+	}
+
+	return gasPayloadWithGas, nil
+}
+
+func (t *TxInternalDataChainDataAnchoring) Validate(stateDB StateDB, currentBlockNumber uint64, onlyMutableChecks bool) error {
+	return nil
+}
+
+func (t *TxInternalDataChainDataAnchoring) Execute(sender ContractRef, vm VM, stateDB StateDB, currentBlockNumber uint64, gas uint64, value *big.Int) (ret []byte, usedGas uint64, err error) {
+	stateDB.IncNonce(sender.Address())
+	return nil, gas, nil
+}
+
+func (t *TxInternalDataChainDataAnchoring) MakeRPCOutput() map[string]interface{} {
+	decoded, err := DecodeAnchoringDataToJSON(t.Payload)
+	if err != nil {
+		logger.Trace("decode anchor payload", "err", err)
+	}
+
+	return map[string]interface{}{
+		"typeInt":    t.Type(),
+		"type":       t.Type().String(),
+		"gas":        hexutil.Uint64(t.GasLimit),
+		"gasPrice":   (*hexutil.Big)(t.Price),
+		"nonce":      hexutil.Uint64(t.AccountNonce),
+		"input":      hexutil.Bytes(t.Payload),
+		"inputJSON":  decoded,
+		"signatures": t.TxSignatures.ToJSON(),
+	}
+}
+
+func (t *TxInternalDataChainDataAnchoring) MarshalJSON() ([]byte, error) {
+	decoded, err := DecodeAnchoringDataToJSON(t.Payload)
+	if err != nil {
+		logger.Trace("decode anchor payload", "err", err)
+	}
+	return json.Marshal(TxInternalDataChainDataAnchoringJSON{
+		t.Type(),
+		t.Type().String(),
+		(hexutil.Uint64)(t.AccountNonce),
+		(*hexutil.Big)(t.Price),
+		(hexutil.Uint64)(t.GasLimit),
+		t.From,
+		t.Payload,
+		decoded,
+		t.TxSignatures.ToJSON(),
+		t.Hash,
+	})
+}
+
+func (t *TxInternalDataChainDataAnchoring) UnmarshalJSON(b []byte) error {
+	js := &TxInternalDataChainDataAnchoringJSON{}
+	if err := json.Unmarshal(b, js); err != nil {
+		return err
+	}
+
+	t.AccountNonce = uint64(js.AccountNonce)
+	t.Price = (*big.Int)(js.Price)
+	t.GasLimit = uint64(js.GasLimit)
+	t.From = js.From
+	t.Payload = js.Payload
+	t.TxSignatures = js.TxSignatures.ToTxSignatures()
+	t.Hash = js.Hash
+
+	return nil
+}

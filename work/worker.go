@@ -1,0 +1,1054 @@
+// Modifications Copyright 2024 The Kaia Authors
+// Modifications Copyright 2018 The klaytn Authors
+// Copyright 2015 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+//
+// This file is derived from miner/worker.go (2018/06/04).
+// Modified and improved for the klaytn development.
+// Modified and improved for the Kaia development.
+
+package work
+
+import (
+	"fmt"
+	"math"
+	"math/big"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/kaiachain/kaia/blockchain"
+	"github.com/kaiachain/kaia/blockchain/state"
+	"github.com/kaiachain/kaia/blockchain/types"
+	"github.com/kaiachain/kaia/blockchain/vm"
+	"github.com/kaiachain/kaia/common"
+	"github.com/kaiachain/kaia/consensus"
+	"github.com/kaiachain/kaia/event"
+	"github.com/kaiachain/kaia/kaiax"
+	"github.com/kaiachain/kaia/kaiax/gov"
+	"github.com/kaiachain/kaia/kerrors"
+	"github.com/kaiachain/kaia/params"
+	"github.com/kaiachain/kaia/storage/database"
+	"github.com/kaiachain/kaia/work/builder"
+	"github.com/rcrowley/go-metrics"
+)
+
+const (
+	miningLogAtDepth = 5
+
+	// txChanSize is the size of channel listening to NewTxsEvent.
+	// The number is referenced from the size of tx pool.
+	txChanSize = 4096
+	// chainHeadChanSize is the size of channel listening to ChainHeadEvent.
+	chainHeadChanSize = 10
+	// chainSideChanSize is the size of channel listening to ChainSideEvent.
+	chainSideChanSize = 10
+	// maxResendSize is the size of resending transactions to peer in order to prevent the txs from missing.
+	maxResendTxSize = 1000
+)
+
+var (
+	// Metrics for miner
+	timeLimitReachedCounter = metrics.NewRegisteredCounter("miner/timelimitreached", nil)
+	tooLongTxCounter        = metrics.NewRegisteredCounter("miner/toolongtx", nil)
+	usedAllTxsCounter       = metrics.NewRegisteredCounter("miner/usedalltxs", nil)
+	checkedTxsGauge         = metrics.NewRegisteredGauge("miner/checkedtxs", nil)
+	tCountGauge             = metrics.NewRegisteredGauge("miner/tcount", nil)
+	nonceTooLowTxsGauge     = metrics.NewRegisteredGauge("miner/nonce/low/txs", nil)
+	nonceTooHighTxsGauge    = metrics.NewRegisteredGauge("miner/nonce/high/txs", nil)
+	gasLimitReachedTxsGauge = metrics.NewRegisteredGauge("miner/limitreached/gas/txs", nil)
+	strangeErrorTxsCounter  = metrics.NewRegisteredCounter("miner/strangeerror/txs", nil)
+	minerBalanceGauge       = metrics.NewRegisteredGauge("miner/balance", nil)
+
+	blockBaseFee              = metrics.NewRegisteredGauge("miner/block/mining/basefee", nil)
+	blobsGauge                = metrics.NewRegisteredGauge("miner/block/mining/blobs", nil)
+	blockMiningTimer          = metrics.NewRegisteredTimer("miner/block/mining/time", nil)
+	blockMiningExecuteTxTimer = metrics.NewRegisteredTimer("miner/block/execute/time", nil)
+	blockMiningCommitTxTimer  = metrics.NewRegisteredTimer("miner/block/commit/time", nil)
+	blockMiningFinalizeTimer  = metrics.NewRegisteredTimer("miner/block/finalize/time", nil)
+
+	accountReadTimer   = metrics.NewRegisteredTimer("miner/block/account/reads", nil)
+	accountHashTimer   = metrics.NewRegisteredTimer("miner/block/account/hashes", nil)
+	accountUpdateTimer = metrics.NewRegisteredTimer("miner/block/account/updates", nil)
+	accountCommitTimer = metrics.NewRegisteredTimer("miner/block/account/commits", nil)
+
+	storageReadTimer   = metrics.NewRegisteredTimer("miner/block/storage/reads", nil)
+	storageHashTimer   = metrics.NewRegisteredTimer("miner/block/storage/hashes", nil)
+	storageUpdateTimer = metrics.NewRegisteredTimer("miner/block/storage/updates", nil)
+	storageCommitTimer = metrics.NewRegisteredTimer("miner/block/storage/commits", nil)
+
+	snapshotAccountReadTimer = metrics.NewRegisteredTimer("miner/snapshot/account/reads", nil)
+	snapshotStorageReadTimer = metrics.NewRegisteredTimer("miner/snapshot/storage/reads", nil)
+	snapshotCommitTimer      = metrics.NewRegisteredTimer("miner/snapshot/commits", nil)
+)
+
+// Task is the workers current environment and holds
+// all of the current state information
+type Task struct {
+	config *params.ChainConfig
+	signer types.Signer
+
+	stateMu sync.RWMutex   // protects state
+	state   *state.StateDB // apply state changes here
+	tcount  int            // tx count in cycle
+	size    uint64         // size of the block we are building
+
+	Block *types.Block // the new block
+
+	header   *types.Header
+	txs      []*types.Transaction
+	receipts []*types.Receipt
+	blobs    int
+
+	createdAt time.Time
+}
+
+// txFitsSize reports whether the transaction fits into the block size limit.
+func (env *Task) txFitsSize(tx *types.Transaction) bool {
+	return env.size+uint64(tx.Size()) < params.MaxBlockSize-maxBlockSizeBufferZone
+}
+
+func (env *Task) txFitsSizeForBundle(nodeAddr common.Address, bundle *builder.Bundle) bool {
+	totalTxSize := uint64(0)
+	for _, txOrGen := range bundle.BundleTxs {
+		tx, err := txOrGen.GetTx(env.state.GetNonce(nodeAddr))
+		if err != nil {
+			// ignore error in this point since it will be handled later as tx generation error in commitBundleTransaction
+			continue
+		}
+		totalTxSize += uint64(tx.Size())
+	}
+	return env.size+totalTxSize < params.MaxBlockSize-maxBlockSizeBufferZone
+}
+
+// Block size is capped by the protocol at params.MaxBlockSize. When producing blocks, we
+// try to say below the size including a buffer zone, this is to avoid going over the
+// maximum size with auxiliary data added into the block.
+const maxBlockSizeBufferZone = 1_000_000
+
+// worker is the main object which takes care of applying messages to the new state
+type worker struct {
+	config *params.ChainConfig
+	engine consensus.Engine
+
+	mu sync.Mutex
+	// startMu serializes start and stop, which must not hold mu: the engine's Start and Stop wait on update().
+	startMu sync.Mutex
+
+	// update loop
+	mux          *event.TypeMux
+	txsCh        chan blockchain.NewTxsEvent
+	txsSub       event.Subscription
+	chainHeadCh  chan blockchain.ChainHeadEvent
+	chainHeadSub event.Subscription
+	chainSideCh  chan blockchain.ChainSideEvent
+	chainSideSub event.Subscription
+	wg           sync.WaitGroup
+
+	backend           Backend
+	chain             BlockChain
+	chainDB           database.DBManager
+	govModule         gov.GovModule
+	executionModules  []kaiax.ExecutionModule
+	txBundlingModules []builder.TxBundlingModule
+
+	// Channels for consensus-worker communication
+	// finalizeCh receives finalized block results for DB write and broadcast
+	finalizeCh <-chan *consensus.ExecutionResult
+	// newSequenceSub receives signals when a new block sequence starts (not round change)
+	newSequenceSub *event.TypeMuxSubscription
+	// Pending work context for async execution
+	pendingWork      *Task
+	pendingWorkStart time.Time
+
+	extra []byte
+
+	currentMu sync.Mutex
+	current   *Task
+	nodeAddr  common.Address
+
+	// atomic status counters
+	mining atomic.Int32
+
+	nodetype common.ConnType
+}
+
+func newWorker(config *params.ChainConfig, engine consensus.Engine, nodeAddr common.Address, backend Backend, mux *event.TypeMux, nodetype common.ConnType, govModule gov.GovModule) *worker {
+	worker := &worker{
+		config:      config,
+		engine:      engine,
+		backend:     backend,
+		mux:         mux,
+		txsCh:       make(chan blockchain.NewTxsEvent, txChanSize),
+		chainHeadCh: make(chan blockchain.ChainHeadEvent, chainHeadChanSize),
+		chainSideCh: make(chan blockchain.ChainSideEvent, chainSideChanSize),
+		chainDB:     backend.ChainDB(),
+		chain:       backend.BlockChain(),
+		nodetype:    nodetype,
+		nodeAddr:    nodeAddr,
+		govModule:   govModule,
+	}
+
+	// Subscribe NewTxsEvent for tx pool
+	worker.txsSub = backend.TxPool().SubscribeNewTxsEvent(worker.txsCh)
+	// Subscribe events for blockchain
+	worker.chainHeadSub = backend.BlockChain().SubscribeChainHeadEvent(worker.chainHeadCh)
+	worker.chainSideSub = backend.BlockChain().SubscribeChainSideEvent(worker.chainSideCh)
+	worker.newSequenceSub = engine.SubscribeNewSequence()
+
+	go worker.update()
+
+	return worker
+}
+
+func (self *worker) setExtra(extra []byte) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+	self.extra = extra
+}
+
+func (self *worker) pending() (*types.Block, types.Receipts, *state.StateDB) {
+	block := self.chain.CurrentBlock()
+	if block == nil {
+		return nil, nil, nil
+	}
+	receipts := self.chain.GetReceiptsByBlockHash(block.Hash())
+	state, err := self.chain.StateAt(block.Root())
+	if err != nil {
+		return nil, nil, nil
+	}
+	return block, receipts, state
+}
+
+func (self *worker) pendingBlock() *types.Block {
+	return self.chain.CurrentBlock()
+}
+
+func (self *worker) start() {
+	self.startMu.Lock()
+	defer self.startMu.Unlock()
+
+	self.mining.Store(1)
+
+	executor := NewDefaultExecutor(self.config, self.chain, self.nodeAddr)
+	executor.SetTxBundlingModules(self.txBundlingModules)
+	self.engine.Start(self.chain, executor)
+}
+
+func (self *worker) stop() {
+	self.wg.Wait()
+
+	self.startMu.Lock()
+	defer self.startMu.Unlock()
+
+	self.engine.Stop()
+
+	self.mining.Store(0)
+}
+
+func (self *worker) handleTxsCh(quitByErr chan bool) {
+	defer self.txsSub.Unsubscribe()
+
+	for {
+		select {
+		// Handle NewTxsEvent
+		case <-self.txsCh:
+			if self.mining.Load() != 0 {
+				// If we're mining, but nothing is being processed, wake on new transactions
+				// Clique consensus removed - no longer needed
+			}
+
+		case <-quitByErr:
+			return
+		}
+	}
+}
+
+func (self *worker) update() {
+	defer func() {
+		self.chainHeadSub.Unsubscribe()
+		self.chainSideSub.Unsubscribe()
+		self.newSequenceSub.Unsubscribe()
+	}()
+
+	quitByErr := make(chan bool, 1)
+	go self.handleTxsCh(quitByErr)
+
+	for {
+		select {
+		// Handle ChainHeadEvent - triggers consensus state update
+		case <-self.chainHeadCh:
+			if h, ok := self.engine.(consensus.Handler); ok {
+				h.NewChainHead()
+			}
+
+		// Handle finalized block from consensus (for DB write and broadcast)
+		case result := <-self.finalizeCh:
+			self.handleFinalizedBlock(result)
+
+		// Handle new sequence event from consensus - start mining next block
+		case <-self.newSequenceSub.Chan():
+			self.commitNewWork()
+
+			// TODO-Klaytn-Issue264 If we are using istanbul BFT, then we always have a canonical chain.
+			//         Later we may be able to refine below code.
+			// Handle ChainSideEvent
+		case <-self.chainSideCh:
+
+			// System stopped
+		case <-self.txsSub.Err():
+			quitByErr <- true
+			return
+		case <-self.chainHeadSub.Err():
+			quitByErr <- true
+			return
+		case <-self.chainSideSub.Err():
+			quitByErr <- true
+			return
+		}
+	}
+}
+
+// makeCurrent creates a new environment for the current cycle.
+func (self *worker) makeCurrent(parent *types.Block, header *types.Header) error {
+	stateDB, err := self.chain.StateAt(parent.Root())
+	if err != nil {
+		return err
+	}
+	work := NewTask(self.config, types.MakeSigner(self.config, header.Number), stateDB, header)
+
+	// Keep track of transactions which return errors so they can be removed
+	work.tcount = 0
+	self.current = work
+	return nil
+}
+
+// waitForIdealBlockTime sleeps until the ideal block time for the next block.
+// This ensures blocks are produced at consistent intervals.
+func (self *worker) waitForIdealBlockTime(parent *types.Block) {
+	if parent == nil {
+		return
+	}
+	parentTimestamp := parent.Time().Int64()
+	ideal := time.Unix(parentTimestamp+params.BlockGenerationInterval, 0)
+	now := time.Now()
+
+	if now.Before(ideal) {
+		wait := ideal.Sub(now)
+		logger.Debug("Waiting for ideal block time", "wait", wait)
+		time.Sleep(wait)
+	}
+}
+
+func (self *worker) commitNewWork() {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+	self.currentMu.Lock()
+	defer self.currentMu.Unlock()
+
+	parent := self.chain.CurrentBlock()
+	nextBlockNum := new(big.Int).Add(parent.Number(), common.Big1)
+
+	// Wait for ideal block time to ensure consistent block intervals
+	self.waitForIdealBlockTime(parent)
+	tstart := time.Now()
+
+	var pending map[common.Address]types.Transactions
+	var err error
+	var nextBaseFee *big.Int
+	// Check any fork transitions needed
+	pending, err = self.backend.TxPool().Pending()
+	if err != nil {
+		logger.Error("Failed to fetch pending transactions", "err", err)
+		return
+	}
+
+	if self.config.IsMagmaForkEnabled(nextBlockNum) {
+		// NOTE-Kaia NextBlockBaseFee needs the header of parent, self.chain.CurrentBlock
+		// So above code, TxPool().Pending(), is separated with this and can be refactored later.
+		pset := self.govModule.GetParamSet(nextBlockNum.Uint64())
+		nextBaseFee = pset.ToKip71Config().NextMagmaBlockBaseFee(parent.Number(), parent.Header().BaseFee, parent.GasUsed())
+		pending = types.FilterTransactionWithBaseFee(pending, nextBaseFee)
+	}
+
+	// Filter txs with txBundlingModules
+	builder.FilterTxs(pending, self.txBundlingModules)
+
+	header := &types.Header{
+		ParentHash: parent.Hash(),
+		Number:     nextBlockNum,
+		Extra:      self.extra,
+		Time:       big.NewInt(tstart.Unix()),
+	}
+	if self.config.IsMagmaForkEnabled(nextBlockNum) {
+		header.BaseFee = nextBaseFee
+	}
+	if err := self.chain.PrepareHeader(header); err != nil {
+		logger.Error("Failed to prepare header for mining", "err", err)
+		return
+	}
+	// Apply KIP-279.
+	if self.config.IsOsakaForkEnabled(header.Number) {
+		// In KIP-279, ExcessBlobGas is defined as follows:
+		// - ExcessBlobGas = max(0, parent.excessBlobGas + parent.blobGasUsed - TARGET_BLOB_GAS_PER_BLOCK)
+		var excessBlobGas uint64
+		if self.config.IsOsakaForkEnabled(parent.Number()) {
+			bcfg := self.config.LatestBlobConfig(header.Number)
+			if bcfg == nil {
+				excessBlobGas = 0
+			} else {
+				excessBlobGas = bcfg.CalcExcessBlobGas(parent.ExcessBlobGas(), parent.BlobGasUsed())
+			}
+		}
+		header.BlobGasUsed = new(uint64)
+		header.ExcessBlobGas = &excessBlobGas
+	}
+	// Could potentially happen if starting to mine in an odd state.
+	err = self.makeCurrent(parent, header)
+	if err != nil {
+		logger.Error("Failed to create mining context", "err", err)
+		return
+	}
+
+	// Obtain current work's state lock after we receive new work assignment.
+	self.current.stateMu.Lock()
+	defer self.current.stateMu.Unlock()
+
+	if err := self.chain.Processor().InitializeState(header, self.current.state); err != nil {
+		logger.Error("Failed to initialize state for mining", "number", header.Number, "err", err)
+		return
+	}
+
+	// Create the current work task
+	// measure miner balance before executing txs
+	minerBalanceGauge.Update(getBalanceForGauge(self.current.state, self.nodeAddr))
+
+	// Sort txs and submit to consensus for execution
+	txs := types.NewTransactionsByPriceAndNonce(self.current.signer, pending, self.current.header.BaseFee)
+
+	// Store pending work context and submit to consensus
+	self.pendingWork = self.current
+	self.pendingWorkStart = tstart
+
+	self.finalizeCh = self.engine.SubmitTransactions(txs, self.current.state, self.current.header, self.mux)
+
+	// Results will be handled in update() loop:
+	// - finalizeCh -> handleFinalizedBlock() for DB write and broadcast
+	// - newSequenceSub -> commitNewWork() for next block (triggered from consensus startNewRound)
+}
+
+// handleFinalizedBlock processes the finalized block result from consensus
+func (self *worker) handleFinalizedBlock(result *consensus.ExecutionResult) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+	self.currentMu.Lock()
+	defer self.currentMu.Unlock()
+
+	if result == nil || result.Block == nil {
+		// Not the proposer - block will be received via ChainHeadEvent
+		logger.Debug("Not proposer, waiting for block via ChainHeadEvent")
+		return
+	}
+
+	work := self.pendingWork
+	if work == nil {
+		logger.Error("No pending work for execution result")
+		return
+	}
+	tstart := self.pendingWorkStart
+
+	work.stateMu.Lock()
+	defer work.stateMu.Unlock()
+
+	// Update work with results from consensus
+	work.txs = result.Transactions()
+	work.tcount = len(work.txs)
+	work.receipts = result.Receipts
+	work.state = result.State
+	work.Block = result.Block
+
+	// We only care about logging if we're actually mining.
+	if self.mining.Load() == 1 {
+		// Update the metrics subsystem with all the measurements
+		accountReadTimer.Update(work.state.AccountReads)
+		accountHashTimer.Update(work.state.AccountHashes)
+		accountUpdateTimer.Update(work.state.AccountUpdates)
+		accountCommitTimer.Update(work.state.AccountCommits)
+
+		storageReadTimer.Update(work.state.StorageReads)
+		storageHashTimer.Update(work.state.StorageHashes)
+		storageUpdateTimer.Update(work.state.StorageUpdates)
+		storageCommitTimer.Update(work.state.StorageCommits)
+
+		snapshotAccountReadTimer.Update(work.state.SnapshotAccountReads)
+		snapshotStorageReadTimer.Update(work.state.SnapshotStorageReads)
+		snapshotCommitTimer.Update(work.state.SnapshotCommits)
+
+		trieAccess := work.state.AccountReads + work.state.AccountHashes + work.state.AccountUpdates + work.state.AccountCommits
+		trieAccess += work.state.StorageReads + work.state.StorageHashes + work.state.StorageUpdates + work.state.StorageCommits
+
+		tCountGauge.Update(int64(work.tcount))
+		blockMiningTime := time.Since(tstart)
+
+		if work.header.BaseFee != nil {
+			blockBaseFee.Update(work.header.BaseFee.Int64() / int64(params.Gkei))
+		}
+		blobsGauge.Update(int64(work.blobs))
+		blockMiningTimer.Update(blockMiningTime)
+		blockMiningCommitTxTimer.Update(result.ExecuteTime)
+		blockMiningExecuteTxTimer.Update(result.ExecuteTime - trieAccess)
+		blockMiningFinalizeTimer.Update(result.FinalizeTime)
+	}
+
+	// Clear pending work
+	self.pendingWork = nil
+	self.finalizeCh = nil
+
+	// Write block to chain (moved from wait() since Seal is already done)
+	block := work.Block
+
+	// Update the block hash in all logs
+	for _, r := range work.receipts {
+		for _, l := range r.Logs {
+			l.BlockHash = block.Hash()
+		}
+	}
+	for _, log := range work.state.Logs() {
+		log.BlockHash = block.Hash()
+	}
+
+	// Write block to database
+	writeStart := time.Now()
+	writeResult, err := self.chain.WriteBlockWithState(block, work.receipts, work.state)
+	if err != nil {
+		if err == blockchain.ErrKnownBlock {
+			logger.Debug("Tried to insert already known block", "num", block.NumberU64(), "hash", block.Hash().String())
+		} else {
+			logger.Error("Failed writing block to chain", "err", err)
+		}
+		return
+	}
+	blockWriteTime := time.Since(writeStart)
+
+	// Broadcast the block and announce chain insertion event
+	self.mux.Post(blockchain.NewMinedBlockEvent{Block: block})
+
+	var events []interface{}
+	logs := work.state.Logs()
+
+	events = append(events, blockchain.ChainEvent{Block: block, Hash: block.Hash(), Logs: logs})
+	if writeResult.Status == blockchain.CanonStatTy {
+		events = append(events, blockchain.ChainHeadEvent{Block: block})
+	}
+
+	// Invoke ExecutionModules after executing a block
+	for _, module := range self.executionModules {
+		if err := module.PostInsertBlock(block); err != nil {
+			logger.Error("Failed to call PostInsertBlock", "err", err)
+		}
+	}
+
+	logger.Info("Successfully wrote mined block", "num", block.NumberU64(),
+		"hash", block.Hash(), "txs", len(block.Transactions()), "elapsed", blockWriteTime)
+	// update() is the only reader of chainHeadCh, and it is blocked until handleFinalizedBlock returns.
+	// The ChainHeadEvent posted below also goes to chainHeadCh. If chainHeadCh is already full
+	// (heads imported during WriteBlockWithState), the post waits for update() forever while holding
+	// the feed's send lock, which blocks every importer. So post from a goroutine, and read chainHeadCh
+	// here only until that post ends; update() reads it again after handleFinalizedBlock returns.
+	// Waiting for the post, instead of returning at once, keeps the events in order.
+	posted := make(chan struct{})
+	go func() {
+		defer close(posted)
+		self.chain.PostChainEvents(events, logs)
+	}()
+	for {
+		select {
+		case <-posted:
+			return
+		case <-self.chainHeadCh:
+			if h, ok := self.engine.(consensus.Handler); ok {
+				h.NewChainHead()
+			}
+		}
+	}
+}
+
+func (self *worker) RegisterExecutionModule(modules ...kaiax.ExecutionModule) {
+	self.executionModules = append(self.executionModules, modules...)
+}
+
+func (self *worker) RegisterTxBundlingModule(modules ...builder.TxBundlingModule) {
+	self.txBundlingModules = append(self.txBundlingModules, modules...)
+}
+
+// Return the balance of the address in KAIA, in int64. If the balance is greater (often happens in private net), return MaxInt64.
+func getBalanceForGauge(state *state.StateDB, nodeAddr common.Address) int64 {
+	balance := new(big.Int).Div(state.GetBalance(nodeAddr), big.NewInt(params.KAIA))
+	if balance.IsInt64() {
+		return balance.Int64()
+	} else {
+		return math.MaxInt64
+	}
+}
+
+func (env *Task) CommitTransactions(mux *event.TypeMux, txs *types.TransactionsByPriceAndNonce, bc BlockChain, nodeAddr common.Address, txBundlingModules []builder.TxBundlingModule) {
+	coalescedLogs := env.ApplyTransactions(txs, bc, nodeAddr, txBundlingModules)
+
+	if len(coalescedLogs) > 0 || env.tcount > 0 {
+		// make a copy, the state caches the logs and these logs get "upgraded" from pending to mined
+		// logs by filling in the block hash when the block was mined by the local miner. This can
+		// cause a race condition if a log was "upgraded" before the PendingLogsEvent is processed.
+		cpy := make([]*types.Log, len(coalescedLogs))
+		for i, l := range coalescedLogs {
+			cpy[i] = new(types.Log)
+			*cpy[i] = *l
+		}
+		go func(logs []*types.Log, tcount int) {
+			if len(logs) > 0 {
+				mux.Post(blockchain.PendingLogsEvent{Logs: logs})
+			}
+			if tcount > 0 {
+				mux.Post(blockchain.PendingStateEvent{})
+			}
+		}(cpy, env.tcount)
+	}
+}
+
+func (env *Task) ApplyTransactions(txs *types.TransactionsByPriceAndNonce, bc BlockChain, nodeAddr common.Address, txBundlingModules []builder.TxBundlingModule) []*types.Log {
+	var (
+		arrayTxs                 = builder.Arrayify(txs)
+		incorporatedTxs, bundles = builder.ExtractBundlesAndIncorporate(arrayTxs, txBundlingModules)
+		totalTxs                 = len(incorporatedTxs)
+		totalBundles             = len(bundles)
+		coalescedLogs            []*types.Log
+	)
+
+	// Limit the execution time of all transactions in a block
+	var abort int32 = 0                   // To break the below `CommitTransactionLoop` for loop when timed out
+	var isExecutingBundleTxs atomic.Int32 // To wait for abort while the bundle is running
+	chDone := make(chan bool)             // To stop the goroutine below when processing txs is completed
+
+	// chEVM is used to notify the below goroutine of the running EVM so it can call evm.Cancel
+	// when timed out.  We use a buffered channel to prevent the main EVM execution routine
+	// from being blocked due to the channel communication.
+	chEVM := make(chan *vm.EVM, 1)
+
+	go func() {
+		blockTimer := time.NewTimer(params.BlockGenerationTimeLimit)
+		timeout := false
+		var evm *vm.EVM
+
+		for {
+			select {
+			case <-blockTimer.C:
+				timeout = true
+				atomic.StoreInt32(&abort, 1)
+
+			case <-chDone:
+				// Everything is done. Stop this goroutine.
+				return
+
+			case evm = <-chEVM:
+			}
+
+			if timeout && evm != nil {
+				// Allow the first transaction to complete although it exceeds the time limit.
+				// Even in this case, the evm will not be canceled if the bundle is running.
+				if env.tcount > 0 && isExecutingBundleTxs.Load() == 0 {
+					// The total time limit reached, thus we stop the currently running EVM.
+					evm.Cancel(vm.CancelByTotalTimeLimit)
+				} else if env.tcount == 0 && len(arrayTxs) > 0 {
+					// Case 'Single long tx':
+					//   T0 (executing tx) ------- T_limit --> abort=1 (but let T0 finish)
+					//   Result: tcount=0 → Log "A single transaction exceeds limit" and "unexecuted transactions due to time limit"
+					//
+					logger.Warn("A single transaction exceeds total time limit", "hash", arrayTxs[0].Hash().String())
+					tooLongTxCounter.Inc(1)
+				}
+				evm = nil
+			}
+		}
+	}()
+
+	vmConfig := &vm.Config{
+		RunningEVM: chEVM,
+	}
+
+	var numTxsChecked int64 = 0
+	var numTxsNonceTooLow int64 = 0
+	var numTxsNonceTooHigh int64 = 0
+	var numTxsGasLimitReached int64 = 0
+
+CommitTransactionLoop:
+	for atomic.LoadInt32(&abort) == 0 {
+		// Retrieve the next transaction and abort if all done
+		if len(incorporatedTxs) == 0 {
+			// To indicate that it does not have enough transactions for params.BlockGenerationTimeLimit.
+			if numTxsChecked > 0 {
+				usedAllTxsCounter.Inc(1)
+			}
+			break
+		}
+
+		var (
+			logs    []*types.Log
+			txOrGen = incorporatedTxs[0]
+			from    common.Address
+		)
+
+		// Verify that tx is included in the bundle
+		targetBundle := &builder.Bundle{}
+		numShift := 1
+		if bundleIdx := builder.FindBundleIdx(bundles, txOrGen); bundleIdx != -1 {
+			targetBundle = bundles[bundleIdx]
+			numShift = len(targetBundle.BundleTxs)
+			// Skip this bundle if target is required but either:
+			// 1. The previous transaction hash doesn't match the target hash, or
+			// 2. The previous transaction failed (receipt status not successful)
+			if discard, err := env.shouldDiscardBundle(targetBundle); discard {
+				logger.Warn("Skipping bundle due to invalid target tx", "err", err.Error(), "target tx", targetBundle.TargetTxHash.String(), "bundle tx", txOrGen.Id.String(), "numShift", numShift)
+				builder.PopTxs(&incorporatedTxs, numShift, &bundles, env.signer)
+				continue
+			}
+		}
+
+		tx, err := txOrGen.GetTx(env.state.GetNonce(nodeAddr))
+		if err != nil {
+			logger.Warn("TxGenerator returned a nil tx", "error", err)
+			builder.PopTxs(&incorporatedTxs, numShift, &bundles, env.signer)
+			continue
+		}
+		if len(targetBundle.BundleTxs) != 0 {
+			// if inclusion of the transaction would put the block size over the
+			// maximum we allow, don't add any more txs to the payload.
+			if !env.txFitsSizeForBundle(nodeAddr, targetBundle) {
+				break
+			}
+		} else {
+			// if inclusion of the transaction would put the block size over the
+			// maximum we allow, don't add any more txs to the payload.
+			if !env.txFitsSize(tx) {
+				break
+			}
+		}
+
+		// Most of the blob gas logic here is agnostic as to if the chain supports
+		// blobs or not, however the max check panics when called on a chain without
+		// a defined schedule, so we need to verify it's safe to call.
+		if env.config.IsOsakaForkEnabled(env.header.Number) {
+			if hasBlobSpace := env.hasBlobSpace(tx, targetBundle, nodeAddr); !hasBlobSpace {
+				builder.PopTxs(&incorporatedTxs, numShift, &bundles, env.signer)
+				continue
+			}
+		}
+
+		// If target is the tx in bundle, len(targetBundle.BundleTxs) is appended to numTxsChecked.
+		numTxsChecked += int64(numShift)
+		// Error may be ignored here. The error has already been checked
+		// during transaction acceptance is the transaction pool.
+		//
+		// We use the eip155 signer regardless of the current hf.
+		from, _ = types.Sender(env.signer, tx)
+
+		// NOTE-Kaia Since Kaia is always in EIP155, the below replay protection code is not needed.
+		// TODO-Kaia-RemoveLater Remove the code commented below.
+		// Check whether the tx is replay protected. If we're not in the EIP155 hf
+		// phase, start ignoring the sender until we do.
+		//if tx.Protected() && !env.config.IsEIP155(env.header.Number) {
+		//	logger.Trace("Ignoring reply protected transaction", "hash", tx.Hash())
+		//	//logger.Error("#### worker.commitTransaction","tx.protected",tx.Protected(),"tx.hash",tx.Hash(),"nonce",tx.Nonce(),"to",tx.To())
+		//	txs.Pop()
+		//	continue
+		//}
+		// Start executing the transaction
+		if len(targetBundle.BundleTxs) != 0 {
+			isExecutingBundleTxs.Store(1)
+			err, tx, logs = env.commitBundleTransaction(targetBundle, bc, nodeAddr, vmConfig)
+			if err != nil && tx != nil {
+				// override sender to error tx
+				from, _ = types.Sender(env.signer, tx)
+			}
+		} else {
+			env.state.SetTxContext(tx.Hash(), common.Hash{}, env.tcount)
+			err, logs = env.commitTransaction(tx, bc, nodeAddr, vmConfig)
+		}
+
+		switch err {
+		case blockchain.ErrNonceTooLow:
+			// New head notification data race between the transaction pool and miner, shift
+			logger.Trace("Skipping transaction with low nonce", "sender", from, "nonce", tx.Nonce())
+			numTxsNonceTooLow++
+			builder.ShiftTxs(&incorporatedTxs, numShift)
+
+		case blockchain.ErrNonceTooHigh:
+			// Reorg notification data race between the transaction pool and miner, skip account =
+			logger.Trace("Skipping account with high nonce", "sender", from, "nonce", tx.Nonce())
+			numTxsNonceTooHigh++
+			builder.PopTxs(&incorporatedTxs, numShift, &bundles, env.signer)
+
+		case vm.ErrTotalTimeLimitReached:
+			logger.Warn("Transaction aborted due to time limit", "hash", tx.Hash().String())
+			// NOTE-Kaia Exit for loop immediately without checking abort variable again.
+			break CommitTransactionLoop
+
+		case blockchain.ErrTxTypeNotSupported:
+			// Pop the unsupported transaction without shifting in the next from the account
+			logger.Trace("Skipping unsupported transaction type", "sender", from, "type", tx.Type())
+			builder.PopTxs(&incorporatedTxs, numShift, &bundles, env.signer)
+
+		case kerrors.ErrRevertedBundleByVmErr:
+			// Pop transaction in bundle reverted by vm err without shifting in the next from the account
+			// During bundle execution, vm err is reverted, including the increment of the nonce, so a pop is executed.
+			logger.Trace("Skipping transaction in bundle reverted by vm err", "sender", from, "hash", tx.Hash().String())
+			builder.PopTxs(&incorporatedTxs, numShift, &bundles, env.signer)
+
+		case kerrors.ErrTxGeneration:
+			// Pop transaction in bundle due to tx generation error without shifting in the next from the account
+			logger.Trace("Skipping transaction in bundle due to tx generation error", "err", err)
+			builder.PopTxs(&incorporatedTxs, numShift, &bundles, env.signer)
+
+		case nil:
+			// Everything ok, collect the logs and shift in the next transaction from the same account
+			coalescedLogs = append(coalescedLogs, logs...)
+			builder.ShiftTxs(&incorporatedTxs, numShift)
+
+		default:
+			// Strange error, discard the transaction and get the next in line (note, the
+			// nonce-too-high clause will prevent us from executing in vain).
+			logger.Warn("Transaction failed, account skipped", "sender", from, "hash", tx.Hash().String(), "err", err)
+			strangeErrorTxsCounter.Inc(1)
+			builder.ShiftTxs(&incorporatedTxs, numShift)
+		}
+		if len(targetBundle.BundleTxs) != 0 {
+			// After the last tx in the bundle finishes, set executingBundleTxs back to 0.
+			isExecutingBundleTxs.Store(0)
+		}
+	}
+
+	// Case 'Multiple txs, limit hit after first tx':
+	//   T0 -- ... -- TN (executing tx) -- T_limit --> abort=1 (cancel TN immediately)
+	//   Result: tcount=N → Log "unexecuted transactions due to time limit"
+	if atomic.LoadInt32(&abort) == 1 {
+		timeLimitReachedCounter.Inc(1)
+		var txHash common.Hash
+		if len(incorporatedTxs) > 0 {
+			txOrGen := incorporatedTxs[0]
+			tx, err := txOrGen.GetTx(env.state.GetNonce(nodeAddr))
+			if err == nil {
+				txHash = tx.Hash()
+			}
+			logger.Warn("Unexecuted transactions due to time limit",
+				"totalTxs", totalTxs,
+				"totalBundles", totalBundles,
+				"executedTxs", env.tcount,
+				"unexecutedTxs", len(incorporatedTxs),
+				"unexecutedBundles", len(bundles),
+				"firstUnexecutedTxHash", txHash.String(),
+				"firstUnexecutedTxInBundle", builder.FindBundleIdx(bundles, txOrGen) != -1,
+			)
+		}
+	}
+
+	// Update the number of transactions checked and dropped during ApplyTransactions.
+	checkedTxsGauge.Update(numTxsChecked)
+	nonceTooLowTxsGauge.Update(numTxsNonceTooLow)
+	nonceTooHighTxsGauge.Update(numTxsNonceTooHigh)
+	gasLimitReachedTxsGauge.Update(numTxsGasLimitReached)
+
+	// Stop the goroutine that has been handling the timer.
+	chDone <- true
+
+	return coalescedLogs
+}
+
+func (env *Task) commitTransaction(tx *types.Transaction, bc BlockChain, nodeAddr common.Address, vmConfig *vm.Config) (error, []*types.Log) {
+	snap := env.state.Snapshot()
+
+	receipt, _, err := bc.ApplyTransaction(env.config, &nodeAddr, env.state, env.header, tx, &env.header.GasUsed, vmConfig)
+	if err != nil {
+		if err != vm.ErrInsufficientBalance && err != vm.ErrTotalTimeLimitReached {
+			tx.MarkUnexecutable(true)
+		}
+		env.state.RevertToSnapshot(snap)
+		return err, nil
+	}
+
+	env.tcount++
+	env.txs = append(env.txs, tx)
+	env.receipts = append(env.receipts, receipt)
+	env.size += uint64(tx.Size())
+	if tx.Type() == types.TxTypeEthereumBlob {
+		env.blobs += len(tx.BlobHashes())
+		*env.header.BlobGasUsed += tx.BlobGas()
+	}
+
+	return nil, receipt.Logs
+}
+
+func (env *Task) commitBundleTransaction(bundle *builder.Bundle, bc BlockChain, nodeAddr common.Address, vmConfig *vm.Config) (error, *types.Transaction, []*types.Log) {
+	lastSnapshot := env.state.Copy()
+	gasUsedSnapshot := env.header.GasUsed
+	blobGasUsedSnapshot := env.header.BlobGasUsed
+	blobsSnapshot := env.blobs
+	tcountSnapshot := env.tcount
+	txs := []*types.Transaction{}
+	receipts := []*types.Receipt{}
+	logs := []*types.Log{}
+
+	markAllTxUnexecutable := func() {
+		for _, txOrGen := range bundle.BundleTxs {
+			if txOrGen.IsConcreteTx() {
+				tx, _ := txOrGen.GetTx(0)
+				tx.MarkUnexecutable(true)
+			}
+		}
+	}
+
+	restoreEnv := func() {
+		env.state.Set(lastSnapshot)
+		env.header.GasUsed = gasUsedSnapshot
+		env.tcount = tcountSnapshot
+		// blob related env are restored to the snapshot
+		env.header.BlobGasUsed = blobGasUsedSnapshot
+		env.blobs = blobsSnapshot
+	}
+
+	var totalTxSize uint64 = 0
+	for _, txOrGen := range bundle.BundleTxs {
+		tx, err := txOrGen.GetTx(env.state.GetNonce(nodeAddr))
+		if err != nil {
+			logger.Error("TxGenerator error", "error", err)
+			markAllTxUnexecutable()
+			restoreEnv()
+			return kerrors.ErrTxGeneration, nil, nil
+		}
+
+		env.state.SetTxContext(tx.Hash(), common.Hash{}, env.tcount)
+		receipt, _, err := bc.ApplyTransaction(env.config, &nodeAddr, env.state, env.header, tx, &env.header.GasUsed, vmConfig)
+		// Bundled tx will be rejected with any receipt.Status other than success.
+		// There may be cases where a revert occurs within the EVM, which could result in an attack on a tx sender in an already executed bundle.
+		if err != nil || receipt.Status != types.ReceiptStatusSuccessful {
+			if err != vm.ErrInsufficientBalance && err != vm.ErrTotalTimeLimitReached {
+				markAllTxUnexecutable()
+			}
+			receiptStatus := ""
+			if receipt != nil {
+				receiptStatus = strconv.FormatUint(uint64(receipt.Status), 10)
+			}
+			logger.Warn("ApplyTransaction error, restoring env",
+				"blockNum", env.header.Number.String(), "txHash", tx.Hash().String(),
+				"error", err, "receiptStatus", receiptStatus,
+			)
+			restoreEnv()
+			if err == nil {
+				err = kerrors.ErrRevertedBundleByVmErr
+			}
+			return err, tx, nil
+		}
+
+		env.tcount++
+		totalTxSize += uint64(tx.Size())
+		txs = append(txs, tx)
+		receipts = append(receipts, receipt)
+		logs = append(logs, receipt.Logs...)
+		if tx.Type() == types.TxTypeEthereumBlob {
+			env.blobs += len(tx.BlobHashes())
+			*env.header.BlobGasUsed += tx.BlobGas()
+		}
+	}
+
+	env.size += totalTxSize
+	env.txs = append(env.txs, txs...)
+	env.receipts = append(env.receipts, receipts...)
+
+	return nil, nil, logs
+}
+
+func (env *Task) shouldDiscardBundle(bundle *builder.Bundle) (bool, error) {
+	if !bundle.TargetRequired {
+		return false, nil
+	}
+	if env.tcount == 0 {
+		return bundle.TargetTxHash != common.Hash{}, fmt.Errorf("target tx %s does not precede the bundle", bundle.TargetTxHash.Hex())
+	} else {
+		// if `env.tcount` is not zero, the `bundle.TargetTxHash` must not be empty hash
+		if bundle.TargetTxHash != env.txs[env.tcount-1].Hash() {
+			return true, fmt.Errorf("target tx %s does not precede the bundle", bundle.TargetTxHash.Hex())
+		}
+		if env.receipts[env.tcount-1].Status != types.ReceiptStatusSuccessful {
+			return true, fmt.Errorf("target tx %s failed with status %d", bundle.TargetTxHash.Hex(), env.receipts[env.tcount-1].Status)
+		}
+	}
+	return false, nil
+}
+
+func (env *Task) flattenTxOrBundle(tx *types.Transaction, bundle *builder.Bundle, nodeAddr common.Address) []*types.Transaction {
+	var txsWillBeExecuted []*types.Transaction
+	if len(bundle.BundleTxs) != 0 {
+		for _, txOrGen := range bundle.BundleTxs {
+			tx, err := txOrGen.GetTx(env.state.GetNonce(nodeAddr))
+			if err != nil {
+				// ignore error in this point since it will be handled later as tx generation error in commitBundleTransaction
+				continue
+			}
+			txsWillBeExecuted = append(txsWillBeExecuted, tx)
+		}
+	} else {
+		txsWillBeExecuted = []*types.Transaction{tx}
+	}
+	return txsWillBeExecuted
+}
+
+// hasBlobSpace checks if the task has enough blob space for the given transaction and bundle.
+// It has already been validated in the pool,
+// but as a precaution it will also return false if the BlobTx does not have a Sidecar.
+func (env *Task) hasBlobSpace(tx *types.Transaction, bundle *builder.Bundle, nodeAddr common.Address) bool {
+	txsWillBeExecuted := env.flattenTxOrBundle(tx, bundle, nodeAddr)
+	blobsWillBeExecuted := 0
+	for _, tx := range txsWillBeExecuted {
+		if tx.Type() == types.TxTypeEthereumBlob {
+			sc := tx.BlobTxSidecar()
+			if sc == nil {
+				logger.Trace("Blob transaction without sidecar", "hash", tx.Hash())
+				return false
+			}
+			blobsWillBeExecuted += len(sc.Blobs)
+		}
+	}
+
+	left := env.config.LatestBlobConfigMax(env.header.Number) - env.blobs
+	if left < blobsWillBeExecuted {
+		logger.Trace("Not enough blob space left for transaction", "hash", tx.Hash(), "left", left, "needed", len(tx.BlobHashes()))
+		return false
+	}
+
+	return true
+}
+
+func NewTask(config *params.ChainConfig, signer types.Signer, statedb *state.StateDB, header *types.Header) *Task {
+	return &Task{
+		config:    config,
+		signer:    signer,
+		state:     statedb,
+		size:      uint64(header.Size()),
+		header:    header,
+		createdAt: time.Now(),
+	}
+}
+
+func (env *Task) Transactions() []*types.Transaction { return env.txs }
+func (env *Task) Receipts() []*types.Receipt         { return env.receipts }

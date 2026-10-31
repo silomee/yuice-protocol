@@ -1,0 +1,167 @@
+// Modifications Copyright 2024 The Kaia Authors
+// Modifications Copyright 2018 The klaytn Authors
+// Copyright 2017 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+//
+// This file is derived from quorum/consensus/istanbul/core/commit.go (2018/06/04).
+// Modified and improved for the klaytn development.
+// Modified and improved for the Kaia development.
+
+package core
+
+import (
+	"github.com/kaiachain/kaia/common"
+	"github.com/kaiachain/kaia/consensus/bft"
+	"github.com/kaiachain/kaia/consensus/istanbul"
+)
+
+func (c *core) sendCommit() {
+	logger := c.logger.NewWith("state", c.state)
+	if c.current.Preprepare == nil {
+		logger.Error("Failed to get parentHash from roundState in sendCommit")
+		return
+	}
+
+	// Do not send message if the owner of the core is not a member of the committee for the current view
+	if !c.current.committee.Contains(c.Address()) {
+		return
+	}
+
+	// TODO-Kaia-Istanbul: generalize broadcastCommit for all istanbul message types
+	sub := c.current.Subject()
+	c.broadcastCommit(sub)
+}
+
+func (c *core) sendCommitForOldBlock(view *bft.View, digest common.Hash, prevHash common.Hash) {
+	sub := &proposalSubject{
+		View:     view,
+		Digest:   digest,
+		PrevHash: prevHash,
+	}
+	c.broadcastCommit(sub)
+}
+
+func (c *core) broadcastCommit(sub *proposalSubject) {
+	logger := c.logger.NewWith("state", c.state)
+
+	encodedCommit, err := bft.Encode(&bft.Commit{View: sub.View, Digest: sub.Digest})
+	if err != nil {
+		logger.Error("Failed to encode", "subject", sub)
+		return
+	}
+
+	c.broadcast(&bft.Message{
+		PrevHash: sub.PrevHash,
+		Code:     bft.MsgCommit,
+		Msg:      encodedCommit,
+	})
+}
+
+func (c *core) handleCommit(msg *bft.Message, src common.Address) error {
+	// Decode COMMIT message
+	var commit *bft.Commit
+	err := msg.Decode(&commit)
+	if err != nil {
+		logger.Error("Failed to decode message", "code", msg.Code, "err", err)
+		return bft.ErrInvalidMessage
+	}
+
+	// logger.Error("receive handle commit","num", commit.View.Sequence)
+	if err := c.checkMessage(msg, commit.View); err != nil {
+		// logger.Error("### istanbul/commit.go checkMessage","num",commit.View.Sequence,"err",err)
+		return err
+	}
+
+	if err := c.verifyCommit(commit, src); err != nil {
+		return err
+	}
+
+	if !c.current.committee.Contains(src) {
+		logger.Warn("received an istanbul commit message from non-committee",
+			"currentSequence", c.current.sequence.Uint64(), "sender", src.String(), "msgView", commit.View.String())
+		return errNotFromCommittee
+	}
+
+	// Verify commit.CommittedSeal is the sender's signature over the proposal's
+	// committed-seal preimage. Without this, an arbitrary seal would be copied verbatim into the sealed block.
+	// commit.Digest is the proposal hash, already validated by verifyCommit above.
+	committedSealPreimage := istanbul.PrepareCommittedSeal(commit.Digest)
+	if c.isPermissionlessAt(commit.View.Sequence.Uint64()) {
+		committedSealPreimage = istanbul.PrepareCommittedSealWithRound(commit.Digest, byte(commit.View.Round.Uint64()))
+	}
+	committer, err := istanbul.GetSignatureAddress(committedSealPreimage, commit.CommittedSeal)
+	if err != nil || committer != src {
+		logger.Warn("invalid committed seal in commit message", "sender", src.String(), "recovered", committer.String(), "err", err)
+		return errInvalidCommittedSeal
+	}
+
+	c.acceptCommit(msg, src)
+
+	// Change to Prepared state once this view has quorum evidence. Where the
+	// hash-lock shortcut applies (IsPermissionlessAt is false), a node locked
+	// on this digest commits directly; otherwise it must also contribute a
+	// PREPARE and establish a certificate for this round before committing.
+	if c.state.Cmp(StatePrepared) < 0 {
+		if !c.isPermissionlessAt(commit.View.Sequence.Uint64()) &&
+			c.current.IsHashLocked() && commit.Digest == c.current.GetLockedHash() {
+			logger.Warn("received commit of the hash locked proposal and change state to prepared", "msgType", bft.MsgCommit)
+			c.setState(StatePrepared)
+			c.sendCommit()
+		} else if c.current.GetPrepareOrCommitSize() >= c.current.requiredMessageCount {
+			logger.Info("received a quorum of the messages and change state to prepared", "msgType", bft.MsgCommit, "valSet", c.current.qualified.Len())
+			c.current.LockHash()
+			c.setState(StatePrepared)
+			c.sendCommit()
+		}
+	}
+
+	// Commit the proposal once we have enough COMMIT messages and we are not in the Committed state.
+	//
+	// If we already have a proposal, we may have chance to speed up the consensus process
+	// by committing the proposal without PREPARE messages.
+	//logger.Error("### consensus check","len(commits)",c.current.Commits.Size(),"f(2/3)",2*c.valSet.F(),"state",c.state.Cmp(StateCommitted))
+	if c.state.Cmp(StateCommitted) < 0 && c.current.Commits.Size() >= c.current.requiredMessageCount {
+		// Still need to call LockHash here since state can skip Prepared state and jump directly to the Committed state.
+		c.current.LockHash()
+		c.commit()
+	}
+
+	return nil
+}
+
+// verifyCommit verifies if the received COMMIT message is equivalent to our subject
+func (c *core) verifyCommit(commit *bft.Commit, src common.Address) error {
+	logger := c.logger.NewWith("from", src.Hex(), "state", c.state)
+
+	sub := c.current.Subject()
+	if !sub.matches(commit.View, commit.Digest) {
+		logger.Warn("Inconsistent subjects between commit and proposal", "expected", sub, "got", commit)
+		return errInconsistentSubject
+	}
+
+	return nil
+}
+
+func (c *core) acceptCommit(msg *bft.Message, src common.Address) error {
+	logger := c.logger.NewWith("from", src.Hex(), "state", c.state)
+
+	// Add the COMMIT message to current round state
+	if err := c.current.Commits.Add(msg); err != nil {
+		logger.Error("Failed to record commit message", "msg", msg, "err", err)
+		return err
+	}
+	return nil
+}

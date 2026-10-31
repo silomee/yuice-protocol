@@ -1,0 +1,1872 @@
+// Modifications Copyright 2024 The Kaia Authors
+// Copyright 2019 The klaytn Authors
+// This file is part of the klaytn library.
+//
+// The klaytn library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The klaytn library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the klaytn library. If not, see <http://www.gnu.org/licenses/>.
+// Modified and improved for the Kaia development.
+
+package cn
+
+import (
+	"bytes"
+	"crypto/ecdsa"
+	"errors"
+	"fmt"
+	"math"
+	"math/big"
+	"math/rand"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/golang/mock/gomock"
+	"github.com/kaiachain/kaia/blockchain"
+	"github.com/kaiachain/kaia/blockchain/types"
+	"github.com/kaiachain/kaia/blockchain/vm"
+	"github.com/kaiachain/kaia/common"
+	"github.com/kaiachain/kaia/common/hexutil"
+	"github.com/kaiachain/kaia/consensus"
+	"github.com/kaiachain/kaia/consensus/faker"
+	"github.com/kaiachain/kaia/crypto"
+	"github.com/kaiachain/kaia/datasync/downloader"
+	"github.com/kaiachain/kaia/event"
+	staking_mock "github.com/kaiachain/kaia/kaiax/staking/mock"
+	"github.com/kaiachain/kaia/networks/p2p"
+	"github.com/kaiachain/kaia/networks/p2p/discover"
+	"github.com/kaiachain/kaia/node/cn/mocks"
+	"github.com/kaiachain/kaia/params"
+	"github.com/kaiachain/kaia/rlp"
+	"github.com/kaiachain/kaia/storage/database"
+	"github.com/kaiachain/kaia/storage/statedb"
+	workmocks "github.com/kaiachain/kaia/work/mocks"
+	"github.com/stretchr/testify/assert"
+)
+
+const blockNum1 = 20190902
+
+var td1 = big.NewInt(123)
+
+const numVals = 6
+
+var (
+	addrs    []common.Address
+	keys     []*ecdsa.PrivateKey
+	nodeids  []discover.NodeID
+	p2pPeers []*p2p.Peer
+	blocks   []*types.Block
+	hashes   []common.Hash
+)
+
+var (
+	tx1 *types.Transaction
+	tx2 *types.Transaction
+	txs types.Transactions
+)
+
+var hash1 common.Hash
+
+func init() {
+	addrs = make([]common.Address, numVals)
+	keys = make([]*ecdsa.PrivateKey, numVals)
+	nodeids = make([]discover.NodeID, numVals)
+	p2pPeers = make([]*p2p.Peer, numVals)
+	blocks = make([]*types.Block, numVals)
+	hashes = make([]common.Hash, numVals)
+
+	for i := range keys {
+		keys[i], _ = crypto.GenerateKey()
+		addrs[i] = crypto.PubkeyToAddress(keys[i].PublicKey)
+		nodeids[i] = discover.PubkeyID(&keys[i].PublicKey)
+		p2pPeers[i] = p2p.NewPeer(nodeids[i], nodeids[i].String(), []p2p.Cap{})
+		blocks[i] = newBlock(i)
+		hashes[i] = blocks[i].Hash()
+	}
+
+	signer := types.MakeSigner(params.TestChainConfig, big.NewInt(2019))
+	tx1 = types.NewTransaction(111, addrs[0], big.NewInt(111), 111, big.NewInt(111), addrs[0][:])
+	tx2 = types.NewTransaction(222, addrs[1], big.NewInt(222), 222, big.NewInt(222), addrs[1][:])
+
+	tx1.Sign(signer, keys[0])
+	tx1.Size()
+	tx2.Sign(signer, keys[1])
+	tx2.Size()
+	txs = types.Transactions{tx1}
+
+	hash1 = tx1.Hash()
+}
+
+func newMocks(t *testing.T) (*gomock.Controller, *workmocks.MockBlockChain, *workmocks.MockTxPool) {
+	mockCtrl := gomock.NewController(t)
+	mockBlockChain := workmocks.NewMockBlockChain(mockCtrl)
+	mockTxPool := workmocks.NewMockTxPool(mockCtrl)
+
+	return mockCtrl, mockBlockChain, mockTxPool
+}
+
+func newBlock(blockNum int) *types.Block {
+	header := &types.Header{
+		Number:     big.NewInt(int64(blockNum)),
+		BlockScore: big.NewInt(int64(1)),
+		Extra:      addrs[0][:],
+		Governance: addrs[0][:],
+		Vote:       addrs[0][:],
+		BaseFee:    big.NewInt(int64(params.DefaultLowerBoundBaseFee)),
+	}
+	header.Hash()
+	block := types.NewBlockWithHeader(header)
+	block = block.WithBody(types.Transactions{})
+	block.Hash()
+	block.Size()
+	block.BlockScore()
+	return block
+}
+
+func newReceipt(gasUsed int) *types.Receipt {
+	rct := types.NewReceipt(uint(gasUsed), common.Hash{}, uint64(gasUsed))
+	rct.Logs = []*types.Log{}
+	rct.Bloom = types.Bloom{}
+	return rct
+}
+
+type testConsensusHandler struct{}
+
+func (h *testConsensusHandler) NewChainHead() error { return nil }
+func (h *testConsensusHandler) HandleMsg(common.Address, p2p.Msg) (bool, error) {
+	return false, nil
+}
+func (h *testConsensusHandler) SetBroadcaster(consensus.Broadcaster) {}
+
+func TestNewProtocolManager(t *testing.T) {
+	// NewProtocolManager uses ConsensusProtocol directly (not handler-provided).
+	// Verifies successful initialization with all Istanbul versions passing the
+	// FastSync version filter (>= kaia63).
+	{
+		mockCtrl, mockBlockChain, mockTxPool := newMocks(t)
+		defer mockCtrl.Finish()
+
+		block := newBlock(blockNum1)
+		mockBlockChain.EXPECT().CurrentBlock().Return(block).Times(1)
+
+		pm, err := NewProtocolManager(params.TestChainConfig, downloader.FastSync, 0, nil, mockTxPool,
+			&testConsensusHandler{}, mockBlockChain, nil, 1, common.CONSENSUSNODE,
+			&Config{DownloaderDisable: true, FetcherDisable: true}, nil)
+
+		assert.NotNil(t, pm)
+		assert.NoError(t, err)
+	}
+}
+
+// The downloader must be constructed with a live staking module.
+func TestNewProtocolManager_downloaderHoldsStakingModule(t *testing.T) {
+	mockCtrl, mockBlockChain, mockTxPool := newMocks(t)
+	defer mockCtrl.Finish()
+
+	// Staking info recovery refuses ranges at or after the Kaia fork, so use a config with none.
+	config := params.TestKaiaConfig("istanbul")
+	mockBlockChain.EXPECT().Config().Return(config).AnyTimes()
+	mockBlockChain.EXPECT().CurrentBlock().Return(newBlock(0)).AnyTimes()
+
+	db := database.NewMemoryDBManager()
+	db.WriteCanonicalHash(common.HexToHash("0x1"), 0)
+
+	mStaking := staking_mock.NewMockStakingModule(mockCtrl)
+	mStaking.EXPECT().GetStakingInfoFromDB(uint64(0)).Return(nil).Times(1)
+
+	pm, err := NewProtocolManager(config, downloader.FullSync, 0, nil, mockTxPool,
+		&testConsensusHandler{}, mockBlockChain, db, 1, common.CONSENSUSNODE,
+		&Config{FetcherDisable: true}, mStaking)
+	assert.NoError(t, err)
+
+	assert.Error(t, pm.Downloader().SyncStakingInfo("no-such-peer", 0, 0))
+}
+
+func TestProtocolManager_RegisterValidator(t *testing.T) {
+	pm := &ProtocolManager{}
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	mockPeerSet := NewMockPeerSet(mockCtrl)
+	pm.peers = mockPeerSet
+
+	val := &ByPassValidator{}
+
+	mockPeerSet.EXPECT().RegisterValidator(common.CONSENSUSNODE, val).Times(1)
+	mockPeerSet.EXPECT().RegisterValidator(common.ENDPOINTNODE, val).Times(1)
+	mockPeerSet.EXPECT().RegisterValidator(common.PROXYNODE, val).Times(1)
+	mockPeerSet.EXPECT().RegisterValidator(common.BOOTNODE, val).Times(1)
+	mockPeerSet.EXPECT().RegisterValidator(common.UNKNOWNNODE, val).Times(1)
+
+	pm.RegisterValidator(common.CONSENSUSNODE, val)
+	pm.RegisterValidator(common.ENDPOINTNODE, val)
+	pm.RegisterValidator(common.PROXYNODE, val)
+	pm.RegisterValidator(common.BOOTNODE, val)
+	pm.RegisterValidator(common.UNKNOWNNODE, val)
+}
+
+func TestProtocolManager_getWSEndPoint(t *testing.T) {
+	pm := &ProtocolManager{}
+
+	ws1 := "abc"
+	ws2 := "123"
+
+	pm.SetWsEndPoint(ws1)
+	assert.Equal(t, ws1, pm.getWSEndPoint())
+
+	pm.SetWsEndPoint(ws2)
+	assert.Equal(t, ws2, pm.getWSEndPoint())
+}
+
+func TestProtocolManager_removePeer(t *testing.T) {
+	peerID := nodeids[0].String()
+
+	{
+		pm := &ProtocolManager{}
+		mockCtrl := gomock.NewController(t)
+
+		mockPeerSet := NewMockPeerSet(mockCtrl)
+		pm.peers = mockPeerSet
+
+		mockPeerSet.EXPECT().Peer(peerID).Return(nil).Times(1)
+		pm.removePeer(peerID)
+
+		mockCtrl.Finish()
+	}
+
+	{
+		pm := &ProtocolManager{}
+		mockCtrl := gomock.NewController(t)
+
+		mockPeerSet := NewMockPeerSet(mockCtrl)
+		pm.peers = mockPeerSet
+
+		mockPeer := NewMockPeer(mockCtrl)
+
+		mockDownloader := mocks.NewMockProtocolManagerDownloader(mockCtrl)
+		mockDownloader.EXPECT().UnregisterPeer(peerID).Times(1)
+		pm.downloader = mockDownloader
+
+		mockFetcher := mocks.NewMockProtocolManagerFetcher(mockCtrl)
+		mockFetcher.EXPECT().ForgetPeer(peerID).Times(1)
+		pm.fetcher = mockFetcher
+
+		// Return
+		mockPeer.EXPECT().ExistSnapExtension().Return(false).Times(1)
+
+		mockPeerSet.EXPECT().Unregister(peerID).Return(expectedErr).Times(1)
+
+		mockPeer.EXPECT().GetP2PPeer().Return(p2pPeers[0]).Times(1)
+
+		mockPeerSet.EXPECT().Peer(peerID).Return(mockPeer).Times(1)
+		pm.removePeer(peerID)
+
+		mockCtrl.Finish()
+	}
+
+	{
+		pm := &ProtocolManager{}
+		mockCtrl := gomock.NewController(t)
+
+		mockPeerSet := NewMockPeerSet(mockCtrl)
+		pm.peers = mockPeerSet
+
+		mockPeer := NewMockPeer(mockCtrl)
+
+		mockDownloader := mocks.NewMockProtocolManagerDownloader(mockCtrl)
+		mockDownloader.EXPECT().UnregisterPeer(peerID).Times(1)
+		pm.downloader = mockDownloader
+
+		mockFetcher := mocks.NewMockProtocolManagerFetcher(mockCtrl)
+		mockFetcher.EXPECT().ForgetPeer(peerID).Times(1)
+		pm.fetcher = mockFetcher
+
+		// Return
+		mockPeer.EXPECT().ExistSnapExtension().Return(false).Times(1)
+
+		mockPeerSet.EXPECT().Unregister(peerID).Return(nil).Times(1)
+
+		mockPeer.EXPECT().GetP2PPeer().Return(p2pPeers[0]).Times(1)
+
+		mockPeerSet.EXPECT().Peer(peerID).Return(mockPeer).Times(1)
+		pm.removePeer(peerID)
+
+		mockCtrl.Finish()
+	}
+}
+
+func TestProtocolManager_handle_peerCap(t *testing.T) {
+	const maxPeers = 10
+	errRegistered := errors.New("registered")
+	genesis, head := blocks[0], blocks[1].Header()
+	chainConfig := params.TestChainConfig
+
+	tests := []struct {
+		name             string
+		trusted, static  bool
+		snapSync         bool
+		peers, snapPeers int
+		want             error
+	}{
+		{name: "plain peer below cap", peers: maxPeers - 1, want: errRegistered},
+		{name: "plain peer at cap", peers: maxPeers, want: p2p.DiscTooManyPeers},
+		{name: "trusted peer at cap", trusted: true, peers: maxPeers, want: errRegistered},
+		{name: "static peer at cap", static: true, peers: maxPeers, want: errRegistered},
+		{name: "plain peer within snap reservation", snapSync: true, peers: ExtraNonSnapPeers, want: errRegistered},
+		{name: "plain peer over snap reservation", snapSync: true, peers: ExtraNonSnapPeers + 1, want: p2p.DiscTooManyPeers},
+		{name: "plain peer within reservation widened by a snap peer", snapSync: true, peers: ExtraNonSnapPeers + 1, snapPeers: 1, want: errRegistered},
+		{name: "trusted peer over snap reservation", trusted: true, snapSync: true, peers: ExtraNonSnapPeers + 1, want: errRegistered},
+		{name: "static peer over snap reservation", static: true, snapSync: true, peers: ExtraNonSnapPeers + 1, want: errRegistered},
+	}
+
+	for _, tc := range tests {
+		for _, channels := range []int{1, 2} {
+			t.Run(fmt.Sprintf("%s/channels=%d", tc.name, channels), func(t *testing.T) {
+				mockCtrl := gomock.NewController(t)
+				defer mockCtrl.Finish()
+
+				mockPeerSet := NewMockPeerSet(mockCtrl)
+				mockPeerSet.EXPECT().WaitSnapExtension(gomock.Any()).Return(nil, nil).Times(1)
+				mockPeerSet.EXPECT().Len().Return(tc.peers).AnyTimes()
+				mockPeerSet.EXPECT().SnapLen().Return(tc.snapPeers).AnyTimes()
+				mockPeerSet.EXPECT().Register(gomock.Any(), gomock.Any()).Return(errRegistered).AnyTimes()
+
+				mockBlockChain := workmocks.NewMockBlockChain(mockCtrl)
+				mockBlockChain.EXPECT().Genesis().Return(genesis).AnyTimes()
+				mockBlockChain.EXPECT().CurrentHeader().Return(head).AnyTimes()
+				mockBlockChain.EXPECT().GetTd(head.Hash(), head.Number.Uint64()).Return(td1).AnyTimes()
+				mockBlockChain.EXPECT().Config().Return(chainConfig).AnyTimes()
+
+				pm := &ProtocolManager{networkId: 1, maxPeers: maxPeers, peers: mockPeerSet, blockchain: mockBlockChain}
+				if tc.snapSync {
+					pm.snapSync = 1
+				}
+
+				local := make([]p2p.MsgReadWriter, channels)
+				var remote *p2p.MsgPipeRW
+				for i := range local {
+					l, r := p2p.MsgPipe()
+					defer l.Close()
+					local[i] = l
+					if i == p2p.ConnDefault {
+						remote = r
+					}
+				}
+				p2pPeer := p2p.NewPeerWithFlags(nodeids[0], nodeids[0].String(), nil, tc.trusted, tc.static)
+				peer, err := newPeerWithRWs(version, p2pPeer, local)
+				assert.NoError(t, err)
+
+				// Remote side of the status handshake.
+				go func() {
+					msg, err := remote.ReadMsg()
+					if err != nil {
+						return
+					}
+					msg.Discard()
+					p2p.Send(remote, StatusMsg, &statusData{
+						ProtocolVersion: uint32(version),
+						NetworkId:       pm.networkId,
+						TD:              td1,
+						CurrentBlock:    head.Hash(),
+						GenesisBlock:    genesis.Hash(),
+						ChainID:         chainConfig.ChainID,
+					})
+				}()
+
+				assert.Equal(t, tc.want, peer.Handle(pm))
+			})
+		}
+	}
+}
+
+func TestProtocolManager_getChainID(t *testing.T) {
+	pm := &ProtocolManager{}
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	cfg := &params.ChainConfig{ChainID: big.NewInt(12345)}
+
+	mockBlockChain := workmocks.NewMockBlockChain(mockCtrl)
+	mockBlockChain.EXPECT().Config().Return(cfg).AnyTimes()
+	pm.blockchain = mockBlockChain
+
+	assert.Equal(t, cfg.ChainID, pm.getChainID())
+}
+
+func TestProtocolManager_processMsg_panicRecover(t *testing.T) {
+	pm := &ProtocolManager{}
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	msgCh := make(chan p2p.Msg)
+	errCh := make(chan error)
+	addr := common.Address{}
+
+	mockPeer := NewMockPeer(mockCtrl)
+	mockPeer.EXPECT().GetVersion().Do(
+		func() { panic("panic test") },
+	)
+
+	// pm.processMsg will be panicked by the mockPeer
+	go pm.processMsg(msgCh, mockPeer, addr, errCh)
+
+	msgCh <- p2p.Msg{Code: NodeDataMsg}
+
+	// panic will be recovered and errCh will receive an error
+	err := <-errCh
+	assert.Equal(t, errUnknownProcessingError, err)
+}
+
+func TestSampleSize(t *testing.T) {
+	peers := make([]Peer, minNumPeersToSendBlock-1)
+	assert.Equal(t, len(peers), sampleSize(peers))
+
+	peers = make([]Peer, 4)
+	assert.Equal(t, minNumPeersToSendBlock, sampleSize(peers))
+
+	peers = make([]Peer, 16)
+	assert.Equal(t, 4, sampleSize(peers))
+}
+
+func TestSamplingPeers(t *testing.T) {
+	peers := make([]Peer, 10)
+	assert.Equal(t, peers, samplingPeers(peers, 20))
+	assert.Equal(t, peers[:5], samplingPeers(peers, 5))
+}
+
+func TestBroadcastBlock_NoParentExists(t *testing.T) {
+	pm := &ProtocolManager{}
+	pm.nodetype = common.ENDPOINTNODE
+	block := newBlock(blockNum1)
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	td := int64(100)
+	mockBlockChain := workmocks.NewMockBlockChain(mockCtrl)
+	mockBlockChain.EXPECT().GetBlock(block.ParentHash(), block.NumberU64()-1).Return(nil).Times(1)
+	mockBlockChain.EXPECT().GetTd(block.ParentHash(), block.NumberU64()-1).Return(big.NewInt(td)).Times(0)
+	pm.blockchain = mockBlockChain
+
+	mockPeers := NewMockPeerSet(mockCtrl)
+	pm.peers = mockPeers
+
+	mockPeer := NewMockPeer(mockCtrl)
+	mockPeers.EXPECT().SamplePeersToSendBlock(block, pm.nodetype).Return([]Peer{mockPeer}).Times(0)
+	mockPeer.EXPECT().AsyncSendNewBlock(block, new(big.Int).Add(block.BlockScore(), big.NewInt(td))).Times(0)
+
+	pm.BroadcastBlock(block)
+}
+
+func TestBroadcastBlock_ParentExists(t *testing.T) {
+	pm := &ProtocolManager{}
+	pm.nodetype = common.ENDPOINTNODE
+	block := newBlock(blockNum1)
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	td := int64(100)
+	mockBlockChain := workmocks.NewMockBlockChain(mockCtrl)
+	mockBlockChain.EXPECT().GetBlock(block.ParentHash(), block.NumberU64()-1).Return(block).Times(1)
+	mockBlockChain.EXPECT().GetTd(block.ParentHash(), block.NumberU64()-1).Return(big.NewInt(td)).Times(1)
+	pm.blockchain = mockBlockChain
+
+	mockPeers := NewMockPeerSet(mockCtrl)
+	pm.peers = mockPeers
+
+	mockPeer := NewMockPeer(mockCtrl)
+	mockPeers.EXPECT().SamplePeersToSendBlock(block, pm.nodetype).Return([]Peer{mockPeer}).Times(1)
+	mockPeer.EXPECT().AsyncSendNewBlock(block, new(big.Int).Add(block.BlockScore(), big.NewInt(td))).Times(1)
+
+	pm.BroadcastBlock(block)
+}
+
+func TestBroadcastBlockHash(t *testing.T) {
+	pm := &ProtocolManager{}
+	pm.nodetype = common.ENDPOINTNODE
+	block := newBlock(blockNum1)
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	// When the given block doesn't exist.
+	{
+		mockBlockChain := workmocks.NewMockBlockChain(mockCtrl)
+		mockBlockChain.EXPECT().HasBlock(block.Hash(), block.NumberU64()).Return(false).Times(1)
+		pm.blockchain = mockBlockChain
+		pm.BroadcastBlockHash(block)
+	}
+
+	// When the given block exists.
+	{
+		mockBlockChain := workmocks.NewMockBlockChain(mockCtrl)
+		mockBlockChain.EXPECT().HasBlock(block.Hash(), block.NumberU64()).Return(true).Times(1)
+		pm.blockchain = mockBlockChain
+
+		mockPeer := NewMockPeer(mockCtrl)
+		mockPeer.EXPECT().AsyncSendNewBlockHash(block).Times(1)
+
+		mockPeers := NewMockPeerSet(mockCtrl)
+		mockPeers.EXPECT().PeersWithoutBlock(block.Hash()).Return([]Peer{mockPeer}).Times(1)
+		pm.peers = mockPeers
+
+		pm.BroadcastBlockHash(block)
+	}
+}
+
+func TestProtocolManager_txBroadcastLoop_FromCN_CN_NotExists(t *testing.T) {
+	pm := &ProtocolManager{}
+	pm.nodetype = common.CONSENSUSNODE
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	txsCh := make(chan blockchain.NewTxsEvent, txChanSize)
+	pm.txsCh = txsCh
+
+	feed := &event.Feed{}
+	pm.txsSub = feed.Subscribe(txsCh)
+
+	peers := newPeerSet()
+	pm.peers = peers
+	cnPeer, pnPeer, enPeer := createAndRegisterPeers(mockCtrl, peers)
+
+	// Using gomock.Eq(txs) for AsyncSendTransactions calls,
+	// since transactions are put into a new list inside broadcastCNTx.
+	cnPeer.EXPECT().KnowsTx(tx1.Hash()).Return(true).Times(1)
+	cnPeer.EXPECT().AsyncSendTransactions(gomock.Eq(txs)).Times(0)
+	pnPeer.EXPECT().AsyncSendTransactions(gomock.Eq(txs)).Times(0)
+	enPeer.EXPECT().AsyncSendTransactions(gomock.Eq(txs)).Times(0)
+
+	go pm.txBroadcastLoop()
+
+	txsCh <- blockchain.NewTxsEvent{Txs: txs}
+
+	time.Sleep(500 * time.Millisecond)
+
+	pm.txsSub.Unsubscribe()
+}
+
+func TestBroadcastTxsFromCN_CN_NotExists(t *testing.T) {
+	pm := &ProtocolManager{}
+	pm.nodetype = common.CONSENSUSNODE
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	peers := newPeerSet()
+	pm.peers = peers
+	cnPeer, pnPeer, enPeer := createAndRegisterPeers(mockCtrl, peers)
+
+	// Using gomock.Eq(txs) for AsyncSendTransactions calls,
+	// since transactions are put into a new list inside broadcastCNTx.
+	cnPeer.EXPECT().KnowsTx(tx1.Hash()).Return(true).Times(1)
+	cnPeer.EXPECT().AsyncSendTransactions(gomock.Eq(txs)).Times(0)
+	pnPeer.EXPECT().AsyncSendTransactions(gomock.Eq(txs)).Times(0)
+	enPeer.EXPECT().AsyncSendTransactions(gomock.Eq(txs)).Times(0)
+
+	pm.BroadcastTxs(txs)
+}
+
+func TestBroadcastTxsFromCN_CN_Exists(t *testing.T) {
+	pm := &ProtocolManager{}
+	pm.nodetype = common.CONSENSUSNODE
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	peers := newPeerSet()
+	pm.peers = peers
+	cnPeer, pnPeer, enPeer := createAndRegisterPeers(mockCtrl, peers)
+
+	// Using gomock.Eq(txs) for AsyncSendTransactions calls,
+	// since transactions are put into a new list inside broadcastCNTx.
+	cnPeer.EXPECT().KnowsTx(tx1.Hash()).Return(false).Times(1)
+	cnPeer.EXPECT().AsyncSendTransactions(gomock.Eq(txs)).Times(1)
+	pnPeer.EXPECT().AsyncSendTransactions(gomock.Eq(txs)).Times(0)
+	enPeer.EXPECT().AsyncSendTransactions(gomock.Eq(txs)).Times(0)
+
+	pm.BroadcastTxs(txs)
+}
+
+func TestBroadcastTxsFromPN_PN_NotExists(t *testing.T) {
+	pm := &ProtocolManager{}
+	pm.nodetype = common.PROXYNODE
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	peers := newPeerSet()
+	pm.peers = peers
+	cnPeer, pnPeer, enPeer := createAndRegisterPeers(mockCtrl, peers)
+
+	cnPeer.EXPECT().KnowsTx(tx1.Hash()).Return(false).Times(1)
+
+	cnPeer.EXPECT().ConnType().Return(common.CONSENSUSNODE).Times(1)
+	pnPeer.EXPECT().ConnType().Return(common.PROXYNODE).Times(1)
+	enPeer.EXPECT().ConnType().Return(common.ENDPOINTNODE).Times(1)
+
+	pnPeer.EXPECT().KnowsTx(tx1.Hash()).Return(true).Times(1)
+
+	cnPeer.EXPECT().SendTransactions(gomock.Eq(txs)).Times(1)
+	pnPeer.EXPECT().SendTransactions(gomock.Eq(txs)).Times(0)
+	enPeer.EXPECT().SendTransactions(gomock.Eq(txs)).Times(0)
+
+	pm.BroadcastTxs(txs)
+}
+
+func TestBroadcastTxsFromPN_PN_Exists(t *testing.T) {
+	pm := &ProtocolManager{}
+	pm.nodetype = common.PROXYNODE
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	peers := newPeerSet()
+	pm.peers = peers
+	cnPeer, pnPeer, enPeer := createAndRegisterPeers(mockCtrl, peers)
+
+	cnPeer.EXPECT().KnowsTx(tx1.Hash()).Return(false).Times(1)
+
+	cnPeer.EXPECT().ConnType().Return(common.CONSENSUSNODE).Times(1)
+	pnPeer.EXPECT().ConnType().Return(common.PROXYNODE).Times(1)
+	enPeer.EXPECT().ConnType().Return(common.ENDPOINTNODE).Times(1)
+
+	pnPeer.EXPECT().KnowsTx(tx1.Hash()).Return(false).Times(1)
+
+	cnPeer.EXPECT().SendTransactions(gomock.Eq(txs)).Times(1)
+	pnPeer.EXPECT().SendTransactions(gomock.Eq(txs)).Times(1)
+	enPeer.EXPECT().SendTransactions(gomock.Eq(txs)).Times(0)
+
+	pm.BroadcastTxs(txs)
+}
+
+func TestBroadcastTxsFromEN_ALL_NotExists(t *testing.T) {
+	pm := &ProtocolManager{}
+	pm.nodetype = common.ENDPOINTNODE
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	peers := newPeerSet()
+	pm.peers = peers
+	cnPeer, pnPeer, enPeer := createAndRegisterPeers(mockCtrl, peers)
+
+	cnPeer.EXPECT().ConnType().Return(common.CONSENSUSNODE).AnyTimes()
+	pnPeer.EXPECT().ConnType().Return(common.PROXYNODE).AnyTimes()
+	enPeer.EXPECT().ConnType().Return(common.ENDPOINTNODE).AnyTimes()
+
+	cnPeer.EXPECT().KnowsTx(tx1.Hash()).Return(true).Times(1)
+	pnPeer.EXPECT().KnowsTx(tx1.Hash()).Return(true).Times(1)
+	enPeer.EXPECT().KnowsTx(tx1.Hash()).Return(true).Times(1)
+
+	cnPeer.EXPECT().SendTransactions(gomock.Eq(txs)).Times(0)
+	pnPeer.EXPECT().SendTransactions(gomock.Eq(txs)).Times(0)
+	enPeer.EXPECT().SendTransactions(gomock.Eq(txs)).Times(0)
+
+	pm.BroadcastTxs(txs)
+}
+
+func TestBroadcastTxsFromEN_ALL_Exists(t *testing.T) {
+	pm := &ProtocolManager{}
+	pm.nodetype = common.ENDPOINTNODE
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	peers := newPeerSet()
+	pm.peers = peers
+	cnPeer, pnPeer, enPeer := createAndRegisterPeers(mockCtrl, peers)
+
+	cnPeer.EXPECT().ConnType().Return(common.CONSENSUSNODE).AnyTimes()
+	pnPeer.EXPECT().ConnType().Return(common.PROXYNODE).AnyTimes()
+	enPeer.EXPECT().ConnType().Return(common.ENDPOINTNODE).AnyTimes()
+
+	cnPeer.EXPECT().KnowsTx(tx1.Hash()).Return(false).Times(1)
+	pnPeer.EXPECT().KnowsTx(tx1.Hash()).Return(false).Times(1)
+	enPeer.EXPECT().KnowsTx(tx1.Hash()).Return(false).Times(1)
+
+	cnPeer.EXPECT().SendTransactions(gomock.Eq(txs)).Times(1)
+	pnPeer.EXPECT().SendTransactions(gomock.Eq(txs)).Times(1)
+	enPeer.EXPECT().SendTransactions(gomock.Eq(txs)).Times(1)
+
+	pm.BroadcastTxs(txs)
+}
+
+func TestBroadcastTxsFrom_DefaultCase(t *testing.T) {
+	pm := &ProtocolManager{}
+	pm.nodetype = common.BOOTNODE
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	peers := newPeerSet()
+	pm.peers = peers
+	createAndRegisterPeers(mockCtrl, peers)
+
+	// There are no expected calls for the mocks.
+	pm.nodetype = common.BOOTNODE
+	pm.BroadcastTxs(txs)
+
+	pm.nodetype = common.UNKNOWNNODE
+	pm.BroadcastTxs(txs)
+}
+
+func TestProtocolManager_txResendLoop(t *testing.T) {
+	pm := &ProtocolManager{}
+	pm.nodetype = common.CONSENSUSNODE
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	peers := newPeerSet()
+	pm.peers = peers
+	createAndRegisterPeers(mockCtrl, peers)
+
+	pm.quitResendCh = make(chan struct{})
+
+	maxTxCount := 100
+	mockTxPool := workmocks.NewMockTxPool(mockCtrl)
+	mockTxPool.EXPECT().CachedPendingTxsByCount(maxTxCount).Return(txs).Times(1)
+
+	pm.txpool = mockTxPool
+
+	go pm.txResendLoop(1, maxTxCount)
+
+	time.Sleep(1500 * time.Millisecond)
+
+	pm.quitResendCh <- struct{}{}
+}
+
+func TestProtocolManager_txResend(t *testing.T) {
+	pm := &ProtocolManager{}
+	pm.nodetype = common.CONSENSUSNODE
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	peers := newPeerSet()
+	pm.peers = peers
+	createAndRegisterPeers(mockCtrl, peers)
+
+	pm.txResend(txs)
+}
+
+func TestReBroadcastTxs_CN(t *testing.T) {
+	pm := &ProtocolManager{}
+	pm.nodetype = common.CONSENSUSNODE
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	peers := newPeerSet()
+	pm.peers = peers
+	createAndRegisterPeers(mockCtrl, peers)
+
+	pm.ReBroadcastTxs(txs)
+}
+
+func TestReBroadcastTxs_PN(t *testing.T) {
+	// CN Peer=0, PN Peer=1
+	{
+		pm := &ProtocolManager{}
+		pm.nodetype = common.PROXYNODE
+		mockCtrl := gomock.NewController(t)
+
+		peers := newPeerSet()
+		pm.peers = peers
+
+		enPeer := NewMockPeer(mockCtrl)
+		enPeer.EXPECT().ConnType().Return(common.PROXYNODE).Times(2)
+		enPeer.EXPECT().SendTransactions(gomock.Eq(txs)).Times(1)
+
+		peers.enpeers[addrs[2]] = enPeer
+		peers.peers[fmt.Sprintf("%x", nodeids[2][:8])] = enPeer
+
+		pm.ReBroadcastTxs(txs)
+
+		mockCtrl.Finish()
+	}
+	// CN Peer=1, PN Peer=0
+	{
+		pm := &ProtocolManager{}
+		pm.nodetype = common.PROXYNODE
+		mockCtrl := gomock.NewController(t)
+
+		peers := newPeerSet()
+		pm.peers = peers
+
+		pnPeer := NewMockPeer(mockCtrl)
+		pnPeer.EXPECT().ConnType().Return(common.CONSENSUSNODE).Times(1)
+		pnPeer.EXPECT().SendTransactions(gomock.Eq(txs)).Times(1)
+
+		peers.pnpeers[addrs[2]] = pnPeer
+		peers.peers[fmt.Sprintf("%x", nodeids[2][:8])] = pnPeer
+
+		pm.ReBroadcastTxs(txs)
+
+		mockCtrl.Finish()
+	}
+}
+
+func TestReBroadcastTxs_EN(t *testing.T) {
+	// PN Peer=0, EN Peer=1
+	{
+		pm := &ProtocolManager{}
+		pm.nodetype = common.ENDPOINTNODE
+		mockCtrl := gomock.NewController(t)
+
+		peers := newPeerSet()
+		pm.peers = peers
+
+		enPeer := NewMockPeer(mockCtrl)
+		enPeer.EXPECT().ConnType().Return(common.ENDPOINTNODE).Times(3)
+		enPeer.EXPECT().SendTransactions(gomock.Eq(txs)).Times(1)
+
+		peers.enpeers[addrs[2]] = enPeer
+		peers.peers[fmt.Sprintf("%x", nodeids[2][:8])] = enPeer
+
+		pm.ReBroadcastTxs(txs)
+
+		mockCtrl.Finish()
+	}
+	// PN Peer=1, EN Peer=0
+	{
+		pm := &ProtocolManager{}
+		pm.nodetype = common.ENDPOINTNODE
+		mockCtrl := gomock.NewController(t)
+
+		peers := newPeerSet()
+		pm.peers = peers
+
+		pnPeer := NewMockPeer(mockCtrl)
+		pnPeer.EXPECT().ConnType().Return(common.PROXYNODE).Times(3)
+		pnPeer.EXPECT().SendTransactions(gomock.Eq(txs)).Times(1)
+
+		peers.pnpeers[addrs[2]] = pnPeer
+		peers.peers[fmt.Sprintf("%x", nodeids[2][:8])] = pnPeer
+
+		pm.ReBroadcastTxs(txs)
+
+		mockCtrl.Finish()
+	}
+}
+
+func TestNodeInfo(t *testing.T) {
+	pm := &ProtocolManager{}
+	pm.nodetype = common.ENDPOINTNODE
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	mockBlockChain := workmocks.NewMockBlockChain(mockCtrl)
+	pm.blockchain = mockBlockChain
+
+	genesis := newBlock(0)
+	block := newBlock(blockNum1)
+	config := &params.ChainConfig{ChainID: td1}
+
+	pm.networkId = 1234
+	mockBlockChain.EXPECT().CurrentBlock().Return(block).Times(1)
+	mockBlockChain.EXPECT().GetTd(block.Hash(), block.NumberU64()).Return(td1).Times(1)
+	mockBlockChain.EXPECT().Genesis().Return(genesis).Times(1)
+	mockBlockChain.EXPECT().Config().Return(config).Times(1)
+
+	expected := &NodeInfo{
+		Network:    pm.networkId,
+		BlockScore: td1,
+		Genesis:    genesis.Hash(),
+		Config:     config,
+		Head:       block.Hash(),
+	}
+
+	assert.Equal(t, *expected, *pm.NodeInfo())
+}
+
+func TestGetCNPeersAndGetENPeers(t *testing.T) {
+	pm := &ProtocolManager{}
+	pm.nodetype = common.ENDPOINTNODE
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	peers := newPeerSet()
+	pm.peers = peers
+
+	cnPeer := NewMockPeer(mockCtrl)
+	pnPeer := NewMockPeer(mockCtrl)
+	enPeer := NewMockPeer(mockCtrl)
+
+	peers.cnpeers[addrs[0]] = cnPeer
+	peers.pnpeers[addrs[1]] = pnPeer
+	peers.enpeers[addrs[2]] = enPeer
+
+	cnPeers := pm.GetCNPeers()
+	enPeers := pm.GetENPeers()
+
+	assert.Equal(t, 1, len(cnPeers))
+	assert.Equal(t, 1, len(enPeers))
+
+	assert.Equal(t, cnPeer, cnPeers[addrs[0]])
+	assert.Equal(t, enPeer, enPeers[addrs[2]])
+}
+
+func TestFindPeers_AddrExists(t *testing.T) {
+	pm := &ProtocolManager{}
+	pm.nodetype = common.ENDPOINTNODE
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	peers := NewMockPeerSet(mockCtrl)
+	pm.peers = peers
+
+	cnPeer := NewMockPeer(mockCtrl)
+	pnPeer := NewMockPeer(mockCtrl)
+	enPeer := NewMockPeer(mockCtrl)
+
+	peersResult := map[string]Peer{"cnPeer": cnPeer, "pnPeer": pnPeer, "enPeer": enPeer}
+
+	peers.EXPECT().Peers().Return(peersResult).Times(1)
+	cnPeer.EXPECT().GetAddr().Return(addrs[0]).Times(1)
+	pnPeer.EXPECT().GetAddr().Return(addrs[1]).Times(1)
+	enPeer.EXPECT().GetAddr().Return(addrs[2]).Times(1)
+
+	targets := make(map[common.Address]bool)
+	targets[addrs[0]] = true
+	targets[addrs[1]] = true
+	targets[addrs[2]] = false
+
+	foundPeers := pm.FindPeers(targets)
+
+	assert.Equal(t, 2, len(foundPeers))
+	assert.EqualValues(t, cnPeer, foundPeers[addrs[0]])
+	assert.EqualValues(t, pnPeer, foundPeers[addrs[1]])
+	assert.Nil(t, foundPeers[addrs[2]])
+}
+
+func TestFindPeers_AddrNotExists(t *testing.T) {
+	pm := &ProtocolManager{}
+	pm.nodetype = common.ENDPOINTNODE
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	peers := NewMockPeerSet(mockCtrl)
+	pm.peers = peers
+
+	cnPeer := NewMockPeer(mockCtrl)
+	pnPeer := NewMockPeer(mockCtrl)
+	enPeer := NewMockPeer(mockCtrl)
+
+	peersResult := map[string]Peer{"cnPeer": cnPeer, "pnPeer": pnPeer, "enPeer": enPeer}
+
+	peers.EXPECT().Peers().Return(peersResult).Times(1)
+	cnPeer.EXPECT().GetAddr().Return(common.Address{}).Times(1)
+	pnPeer.EXPECT().GetAddr().Return(common.Address{}).Times(1)
+	enPeer.EXPECT().GetAddr().Return(common.Address{}).Times(1)
+
+	cnPeer.EXPECT().GetP2PPeerID().Return(nodeids[0]).Times(1)
+	pnPeer.EXPECT().GetP2PPeerID().Return(nodeids[1]).Times(1)
+	enPeer.EXPECT().GetP2PPeerID().Return(nodeids[2]).Times(1)
+
+	cnPeer.EXPECT().SetAddr(addrs[0]).Times(1)
+	pnPeer.EXPECT().SetAddr(addrs[1]).Times(1)
+	enPeer.EXPECT().SetAddr(addrs[2]).Times(1)
+
+	targets := make(map[common.Address]bool)
+	targets[addrs[0]] = true
+	targets[addrs[1]] = true
+	targets[addrs[2]] = false
+
+	foundPeers := pm.FindPeers(targets)
+
+	assert.Equal(t, 2, len(foundPeers))
+	assert.EqualValues(t, cnPeer, foundPeers[addrs[0]])
+	assert.EqualValues(t, pnPeer, foundPeers[addrs[1]])
+	assert.Nil(t, foundPeers[addrs[2]])
+}
+
+func TestFindCNPeers(t *testing.T) {
+	pm := &ProtocolManager{}
+	pm.nodetype = common.ENDPOINTNODE
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	peers := newPeerSet()
+	pm.peers = peers
+
+	cnPeer1 := NewMockPeer(mockCtrl)
+	cnPeer2 := NewMockPeer(mockCtrl)
+	cnPeer3 := NewMockPeer(mockCtrl)
+
+	peers.cnpeers[addrs[0]] = cnPeer1
+	peers.cnpeers[addrs[1]] = cnPeer2
+	peers.cnpeers[addrs[2]] = cnPeer3
+
+	targets := make(map[common.Address]bool)
+	targets[addrs[0]] = true
+	targets[addrs[1]] = true
+	targets[addrs[2]] = false
+
+	foundCNPeers := pm.FindCNPeers(targets)
+
+	assert.Equal(t, 2, len(foundCNPeers))
+	assert.EqualValues(t, cnPeer1, foundCNPeers[addrs[0]])
+	assert.EqualValues(t, cnPeer2, foundCNPeers[addrs[1]])
+	assert.Nil(t, foundCNPeers[addrs[2]])
+}
+
+func TestGetPeers_AddrExists(t *testing.T) {
+	pm := &ProtocolManager{}
+	pm.nodetype = common.ENDPOINTNODE
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	peers := NewMockPeerSet(mockCtrl)
+	pm.peers = peers
+
+	cnPeer := NewMockPeer(mockCtrl)
+	pnPeer := NewMockPeer(mockCtrl)
+	enPeer := NewMockPeer(mockCtrl)
+
+	peersResult := map[string]Peer{"cnPeer": cnPeer, "pnPeer": pnPeer, "enPeer": enPeer}
+
+	peers.EXPECT().Peers().Return(peersResult).Times(1)
+	cnPeer.EXPECT().GetAddr().Return(addrs[0]).Times(1)
+	pnPeer.EXPECT().GetAddr().Return(addrs[1]).Times(1)
+	enPeer.EXPECT().GetAddr().Return(addrs[2]).Times(1)
+
+	foundAddrs := pm.GetPeers()
+
+	assert.Equal(t, 3, len(foundAddrs))
+	assert.True(t, contains(foundAddrs, addrs[0]))
+	assert.True(t, contains(foundAddrs, addrs[1]))
+	assert.True(t, contains(foundAddrs, addrs[2]))
+}
+
+func TestGetPeers_AddrNotExists(t *testing.T) {
+	pm := &ProtocolManager{}
+	pm.nodetype = common.ENDPOINTNODE
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	peers := NewMockPeerSet(mockCtrl)
+	pm.peers = peers
+
+	cnPeer := NewMockPeer(mockCtrl)
+	pnPeer := NewMockPeer(mockCtrl)
+	enPeer := NewMockPeer(mockCtrl)
+
+	peersResult := map[string]Peer{"cnPeer": cnPeer, "pnPeer": pnPeer, "enPeer": enPeer}
+
+	peers.EXPECT().Peers().Return(peersResult).Times(1)
+	cnPeer.EXPECT().GetAddr().Return(common.Address{}).Times(1)
+	pnPeer.EXPECT().GetAddr().Return(common.Address{}).Times(1)
+	enPeer.EXPECT().GetAddr().Return(common.Address{}).Times(1)
+
+	cnPeer.EXPECT().GetP2PPeerID().Return(nodeids[0]).Times(1)
+	pnPeer.EXPECT().GetP2PPeerID().Return(nodeids[1]).Times(1)
+	enPeer.EXPECT().GetP2PPeerID().Return(nodeids[2]).Times(1)
+
+	cnPeer.EXPECT().SetAddr(addrs[0]).Times(1)
+	pnPeer.EXPECT().SetAddr(addrs[1]).Times(1)
+	enPeer.EXPECT().SetAddr(addrs[2]).Times(1)
+
+	foundAddrs := pm.GetPeers()
+
+	assert.Equal(t, 3, len(foundAddrs))
+	assert.True(t, contains(foundAddrs, addrs[0]))
+	assert.True(t, contains(foundAddrs, addrs[1]))
+	assert.True(t, contains(foundAddrs, addrs[2]))
+}
+
+func TestEnqueue(t *testing.T) {
+	pm := &ProtocolManager{}
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	fetcherMock := mocks.NewMockProtocolManagerFetcher(mockCtrl)
+	pm.fetcher = fetcherMock
+
+	block := newBlock(blockNum1)
+	id := nodeids[0].String()
+
+	// The consensus engine is the only caller, so its blocks bypass the byte budget.
+	fetcherMock.EXPECT().EnqueueTrusted(id, block).Times(1)
+	pm.Enqueue(id, block)
+}
+
+func TestProtocolManager_Downloader(t *testing.T) {
+	pm := &ProtocolManager{}
+	assert.Nil(t, pm.Downloader())
+
+	downloader := &downloader.Downloader{}
+	pm.downloader = downloader
+
+	assert.Equal(t, downloader, pm.Downloader())
+}
+
+func TestProtocolManager_SetWsEndPoint(t *testing.T) {
+	pm := &ProtocolManager{}
+	assert.Equal(t, "", pm.wsendpoint)
+
+	wsep := "wsep"
+	pm.SetWsEndPoint(wsep)
+	assert.Equal(t, wsep, pm.wsendpoint)
+}
+
+func TestBroadcastTxsSortedByPriceAndTime(t *testing.T) {
+	// Generate a batch of accounts to start with
+	keys := make([]*ecdsa.PrivateKey, 10)
+	for i := range keys {
+		keys[i], _ = crypto.GenerateKey()
+	}
+	signer := types.LatestSignerForChainID(big.NewInt(1))
+
+	// Generate a batch of transactions.
+	// txs[0:4] - legacyTxType with gasPrice 25ston. txs[5:10] - dynamicFeeTxType with gasPrice 25ston + tip.
+	txs := types.Transactions{}
+	for _, key := range keys[0:5] {
+		tx, _ := types.SignTx(types.NewTransaction(0, common.Address{}, big.NewInt(100), 100, big.NewInt(25*params.Gkei), nil), signer, key)
+		txs = append(txs, tx)
+	}
+	for i, key := range keys[5:10] {
+		tx, _ := types.SignTx(types.NewTx(&types.TxInternalDataEthereumDynamicFee{
+			AccountNonce: uint64(0),
+			Recipient:    &common.Address{},
+			Amount:       big.NewInt(100),
+			GasLimit:     100,
+			GasFeeCap:    big.NewInt(int64(25*params.Gkei + i + 1)),
+			GasTipCap:    big.NewInt(int64(i + 1)),
+			Payload:      nil,
+		}), signer, key)
+		txs = append(txs, tx)
+	}
+
+	// Shuffle transactions.
+	rand.Shuffle(len(txs), func(i, j int) {
+		txs[i], txs[j] = txs[j], txs[i]
+	})
+
+	sortedTxs := make(types.Transactions, len(txs))
+	copy(sortedTxs, txs)
+
+	// Sort transaction by time.
+	sortedTxs = types.SortTxsByPriceAndTime(sortedTxs, big.NewInt(25*params.Gkei))
+
+	pm := &ProtocolManager{}
+	pm.nodetype = common.ENDPOINTNODE
+
+	peers := newPeerSet()
+	basePeer, _, oppositePipe := newBasePeer()
+
+	pm.peers = peers
+	pm.peers.Register(basePeer, nil)
+
+	go func(t *testing.T) {
+		pm.BroadcastTxs(txs)
+	}(t)
+
+	receivedMsg, err := oppositePipe.ReadMsg()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var receivedTxs types.Transactions
+	if err := receivedMsg.Decode(&receivedTxs); err != nil {
+		t.Fatal(err)
+	}
+
+	assert.Equal(t, len(txs), len(receivedTxs))
+
+	// It should be received transaction with sorted by times.
+	for i, tx := range receivedTxs {
+		assert.True(t, basePeer.KnowsTx(tx.Hash()))
+		assert.Equal(t, sortedTxs[i].Hash(), tx.Hash())
+		assert.False(t, sortedTxs[i].Time().Equal(tx.Time()))
+	}
+}
+
+func TestReBroadcastTxsSortedByTime(t *testing.T) {
+	// Generate a batch of accounts to start with
+	keys := make([]*ecdsa.PrivateKey, 10)
+	for i := range keys {
+		keys[i], _ = crypto.GenerateKey()
+	}
+	signer := types.LatestSignerForChainID(big.NewInt(1))
+
+	// Generate a batch of transactions.
+	// txs[0:4] - legacyTxType with gasPrice 25ston. txs[5:10] - dynamicFeeTxType with gasPrice 25ston + tip.
+	txs := types.Transactions{}
+	for _, key := range keys[0:4] {
+		tx, _ := types.SignTx(types.NewTransaction(0, common.Address{}, big.NewInt(100), 100, big.NewInt(25*params.Gkei), nil), signer, key)
+		txs = append(txs, tx)
+	}
+	for i, key := range keys[5:10] {
+		tx, _ := types.SignTx(types.NewTx(&types.TxInternalDataEthereumDynamicFee{
+			AccountNonce: uint64(0),
+			Recipient:    &common.Address{},
+			Amount:       big.NewInt(100),
+			GasLimit:     100,
+			GasFeeCap:    big.NewInt(int64(25*params.Gkei + i + 1)),
+			GasTipCap:    big.NewInt(int64(i + 1)),
+			Payload:      nil,
+		}), signer, key)
+		txs = append(txs, tx)
+	}
+
+	// Shuffle transactions.
+	rand.Shuffle(len(txs), func(i, j int) {
+		txs[i], txs[j] = txs[j], txs[i]
+	})
+
+	sortedTxs := make(types.Transactions, len(txs))
+	copy(sortedTxs, txs)
+
+	// Sort transaction by time.
+	sortedTxs = types.SortTxsByPriceAndTime(sortedTxs, big.NewInt(25*params.Gkei))
+
+	pm := &ProtocolManager{}
+	pm.nodetype = common.ENDPOINTNODE
+
+	peers := newPeerSet()
+	basePeer, _, oppositePipe := newBasePeer()
+
+	pm.peers = peers
+	pm.peers.Register(basePeer, nil)
+
+	go func(t *testing.T) {
+		pm.ReBroadcastTxs(txs)
+	}(t)
+
+	receivedMsg, err := oppositePipe.ReadMsg()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var receivedTxs types.Transactions
+	if err := receivedMsg.Decode(&receivedTxs); err != nil {
+		t.Fatal(err)
+	}
+
+	assert.Equal(t, len(txs), len(receivedTxs))
+
+	// It should be received transaction with sorted by times.
+	for i, tx := range receivedTxs {
+		assert.Equal(t, sortedTxs[i].Hash(), tx.Hash())
+		assert.False(t, sortedTxs[i].Time().Equal(tx.Time()))
+	}
+}
+
+func contains(addrs []common.Address, item common.Address) bool {
+	return slices.Contains(addrs, item)
+}
+
+func createAndRegisterPeers(mockCtrl *gomock.Controller, peers *peerSet) (*MockPeer, *MockPeer, *MockPeer) {
+	cnPeer := NewMockPeer(mockCtrl)
+	pnPeer := NewMockPeer(mockCtrl)
+	enPeer := NewMockPeer(mockCtrl)
+
+	peers.cnpeers[addrs[0]] = cnPeer
+	peers.pnpeers[addrs[1]] = pnPeer
+	peers.enpeers[addrs[2]] = enPeer
+
+	peers.peers[fmt.Sprintf("%x", nodeids[0][:8])] = cnPeer
+	peers.peers[fmt.Sprintf("%x", nodeids[1][:8])] = pnPeer
+	peers.peers[fmt.Sprintf("%x", nodeids[2][:8])] = enPeer
+
+	return cnPeer, pnPeer, enPeer
+}
+
+var (
+	// testKey is a private key to use for funding a tester account.
+	testKey, _ = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+
+	// testAddr is the Ethereum address of the tester account.
+	testAddr = crypto.PubkeyToAddress(testKey.PublicKey)
+)
+
+func newTestBackendWithGenerator(blocks int, generator func(int, *blockchain.BlockGen)) (database.DBManager, *blockchain.BlockChain) {
+	var (
+		// Create a database pre-initialize with a genesis block
+		db     = database.NewMemoryDBManager()
+		config = params.TestChainConfig
+		sealer = faker.NewFaker()
+	)
+
+	gspec := &blockchain.Genesis{
+		Config: config,
+		Alloc:  blockchain.GenesisAlloc{testAddr: {Balance: big.NewInt(100_000_000_000_000_000)}},
+	}
+	genesis := gspec.MustCommit(db)
+	cacheConfig := &blockchain.CacheConfig{
+		CacheSize:           512,
+		BlockInterval:       blockchain.DefaultBlockInterval,
+		TriesInMemory:       blockchain.DefaultTriesInMemory,
+		TrieNodeCacheConfig: statedb.GetEmptyTrieNodeCacheConfig(),
+		SnapshotCacheSize:   512,
+		ArchiveMode:         true, // Archive mode
+	}
+	chain, _ := blockchain.NewBlockChain(db, cacheConfig, config, sealer, vm.Config{})
+
+	bs, _ := blockchain.GenerateChain(config, genesis, sealer, db, blocks, generator)
+	if _, err := chain.InsertChain(bs); err != nil {
+		panic(err)
+	}
+	for i, block := range bs {
+		chain.StateCache().TrieDB().Commit(block.Root(), false, uint64(i))
+	}
+
+	return db, chain
+}
+
+// Tests that block headers can be retrieved from a remote chain based on user queries.
+func TestGetBlockHeaders(t *testing.T) {
+	t.Parallel()
+
+	db, backend := newTestBackendWithGenerator(downloader.MaxHeaderFetch+15, nil)
+	peer, _, net := newBasePeer()
+
+	// Create a "random" unknown hash for testing
+	var unknown common.Hash
+	for i := range unknown {
+		unknown[i] = byte(i)
+	}
+	getHashes := func(from, limit uint64) (hashes []common.Hash) {
+		for i := range limit {
+			hashes = append(hashes, backend.GetBlockByNumber(from-1-i).Hash())
+		}
+		return hashes
+	}
+
+	limit := uint64(downloader.MaxHeaderFetch)
+	tests := []struct {
+		query  *getBlockHeadersData // The query to execute for header retrieval
+		expect []common.Hash        // The hashes of the block whose headers are expected
+	}{
+		// A single random block should be retrievable by hash
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Hash: backend.GetBlockByNumber(limit / 2).Hash()}, Amount: 1},
+			[]common.Hash{backend.GetBlockByNumber(limit / 2).Hash()},
+		},
+		// A single random block should be retrievable by number
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Number: limit / 2}, Amount: 1},
+			[]common.Hash{backend.GetBlockByNumber(limit / 2).Hash()},
+		},
+		// Multiple headers should be retrievable in both directions
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Number: limit / 2}, Amount: 3},
+			[]common.Hash{
+				backend.GetBlockByNumber(limit / 2).Hash(),
+				backend.GetBlockByNumber(limit/2 + 1).Hash(),
+				backend.GetBlockByNumber(limit/2 + 2).Hash(),
+			},
+		},
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Number: limit / 2}, Amount: 3, Reverse: true},
+			[]common.Hash{
+				backend.GetBlockByNumber(limit / 2).Hash(),
+				backend.GetBlockByNumber(limit/2 - 1).Hash(),
+				backend.GetBlockByNumber(limit/2 - 2).Hash(),
+			},
+		},
+		// Multiple headers with skip lists should be retrievable
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Number: limit / 2}, Skip: 3, Amount: 3},
+			[]common.Hash{
+				backend.GetBlockByNumber(limit / 2).Hash(),
+				backend.GetBlockByNumber(limit/2 + 4).Hash(),
+				backend.GetBlockByNumber(limit/2 + 8).Hash(),
+			},
+		},
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Number: limit / 2}, Skip: 3, Amount: 3, Reverse: true},
+			[]common.Hash{
+				backend.GetBlockByNumber(limit / 2).Hash(),
+				backend.GetBlockByNumber(limit/2 - 4).Hash(),
+				backend.GetBlockByNumber(limit/2 - 8).Hash(),
+			},
+		},
+		// The chain endpoints should be retrievable
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Number: 0}, Amount: 1},
+			[]common.Hash{backend.GetBlockByNumber(0).Hash()},
+		},
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Number: backend.CurrentBlock().Number().Uint64()}, Amount: 1},
+			[]common.Hash{backend.CurrentBlock().Hash()},
+		},
+		// If the peer requests a bit into the future, we deliver what we have
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Number: backend.CurrentBlock().Number().Uint64()}, Amount: 10},
+			[]common.Hash{backend.CurrentBlock().Hash()},
+		},
+		// Ensure protocol limits are honored
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Number: backend.CurrentBlock().Number().Uint64() - 1}, Amount: limit + 10, Reverse: true},
+			getHashes(backend.CurrentBlock().Number().Uint64(), limit),
+		},
+		// Check that requesting more than available is handled gracefully
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Number: backend.CurrentBlock().Number().Uint64() - 4}, Skip: 3, Amount: 3},
+			[]common.Hash{
+				backend.GetBlockByNumber(backend.CurrentBlock().Number().Uint64() - 4).Hash(),
+				backend.GetBlockByNumber(backend.CurrentBlock().Number().Uint64()).Hash(),
+			},
+		},
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Number: 4}, Skip: 3, Amount: 3, Reverse: true},
+			[]common.Hash{
+				backend.GetBlockByNumber(4).Hash(),
+				backend.GetBlockByNumber(0).Hash(),
+			},
+		},
+		// Check that requesting more than available is handled gracefully, even if mid skip
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Number: backend.CurrentBlock().Number().Uint64() - 4}, Skip: 2, Amount: 3},
+			[]common.Hash{
+				backend.GetBlockByNumber(backend.CurrentBlock().Number().Uint64() - 4).Hash(),
+				backend.GetBlockByNumber(backend.CurrentBlock().Number().Uint64() - 1).Hash(),
+			},
+		},
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Number: 4}, Skip: 2, Amount: 3, Reverse: true},
+			[]common.Hash{
+				backend.GetBlockByNumber(4).Hash(),
+				backend.GetBlockByNumber(1).Hash(),
+			},
+		},
+		// Check a corner case where requesting more can iterate past the endpoints
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Number: 2}, Amount: 5, Reverse: true},
+			[]common.Hash{
+				backend.GetBlockByNumber(2).Hash(),
+				backend.GetBlockByNumber(1).Hash(),
+				backend.GetBlockByNumber(0).Hash(),
+			},
+		},
+		// Check a corner case where skipping causes overflow with reverse=false
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Number: 1}, Amount: 2, Reverse: false, Skip: math.MaxUint64 - 1},
+			[]common.Hash{
+				backend.GetBlockByNumber(1).Hash(),
+			},
+		},
+		// Check a corner case where skipping causes overflow with reverse=true
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Number: 1}, Amount: 2, Reverse: true, Skip: math.MaxUint64 - 1},
+			[]common.Hash{
+				backend.GetBlockByNumber(1).Hash(),
+			},
+		},
+		// Check another corner case where skipping causes overflow with reverse=false
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Number: 1}, Amount: 2, Reverse: false, Skip: math.MaxUint64},
+			[]common.Hash{
+				backend.GetBlockByNumber(1).Hash(),
+			},
+		},
+		// Check another corner case where skipping causes overflow with reverse=true
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Number: 1}, Amount: 2, Reverse: true, Skip: math.MaxUint64},
+			[]common.Hash{
+				backend.GetBlockByNumber(1).Hash(),
+			},
+		},
+		// Check a corner case where skipping overflow loops back into the chain start
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Hash: backend.GetBlockByNumber(3).Hash()}, Amount: 2, Reverse: false, Skip: math.MaxUint64 - 1},
+			[]common.Hash{
+				backend.GetBlockByNumber(3).Hash(),
+			},
+		},
+		// Check a corner case where skipping overflow loops back to the same header
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Hash: backend.GetBlockByNumber(1).Hash()}, Amount: 2, Reverse: false, Skip: math.MaxUint64},
+			[]common.Hash{
+				backend.GetBlockByNumber(1).Hash(),
+			},
+		},
+		// Check that non existing headers aren't returned
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Hash: unknown}, Amount: 1},
+			[]common.Hash{},
+		},
+		{
+			&getBlockHeadersData{Origin: hashOrNumber{Number: backend.CurrentBlock().Number().Uint64() + 1}, Amount: 1},
+			[]common.Hash{},
+		},
+	}
+
+	pm, err := NewProtocolManager(params.TestChainConfig, downloader.FullSync, 1, nil, nil, faker.NewFaker(), backend, db, 1, common.ENDPOINTNODE, &Config{TxResendUseLegacy: false, TxResendInterval: 1, TxResendCount: 0}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Run each of the tests and verify the results against the chain
+	for i, tt := range tests {
+		// Collect the headers to expect in the response
+		var headers []*types.Header
+		for _, hash := range tt.expect {
+			headers = append(headers, backend.GetBlockByHash(hash).Header())
+		}
+		// Send the hash request and verify the response
+		_, r, _ := rlp.EncodeToReader(tt.query)
+		go func() {
+			handleBlockHeadersRequestMsg(pm, peer, p2p.Msg{Code: BlockHeadersRequestMsg, Payload: r})
+		}()
+		msg, err := net.ReadMsg()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var receivedHeaders []*types.Header
+		if err := msg.Decode(&receivedHeaders); err != nil {
+			t.Fatal(err)
+		}
+		encodedHeaders, _ := rlp.EncodeToBytes(headers)
+		encodedReceivedHeaders, _ := rlp.EncodeToBytes(receivedHeaders)
+		if !bytes.Equal(encodedHeaders, encodedReceivedHeaders) {
+			t.Fatalf("test %d: headers mismatch, expected: %v, received: %v", i, headers, receivedHeaders)
+		}
+
+		// If the test used number origins, repeat with hashes as the origin too
+		if tt.query.Origin.Hash == (common.Hash{}) {
+			if origin := backend.GetBlockByNumber(tt.query.Origin.Number); origin != nil {
+				tt.query.Origin.Hash, tt.query.Origin.Number = origin.Hash(), 0
+				_, r, _ := rlp.EncodeToReader(tt.query)
+				go func() {
+					handleBlockHeadersRequestMsg(pm, peer, p2p.Msg{Code: BlockHeadersRequestMsg, Payload: r})
+				}()
+				msg, err := net.ReadMsg()
+				if err != nil {
+					t.Error(err)
+				}
+				if err := msg.Decode(&receivedHeaders); err != nil {
+					t.Fatal(err)
+				}
+				encodedHeaders, _ := rlp.EncodeToBytes(headers)
+				encodedReceivedHeaders, _ := rlp.EncodeToBytes(receivedHeaders)
+				if !bytes.Equal(encodedHeaders, encodedReceivedHeaders) {
+					t.Errorf("test %d: headers mismatch, expected: %v, received: %v", i, headers, receivedHeaders)
+				}
+			}
+		}
+	}
+}
+
+// Helper functions for sidecarReqManager tests
+
+func newTestSidecarReqManager(cooldown time.Duration, maxTry int) *sidecarReqManager {
+	return &sidecarReqManager{
+		list:     make(map[common.Hash]*sidecarReq),
+		cooldown: cooldown,
+		maxTry:   maxTry,
+	}
+}
+
+func newTestBlobSidecarsRequestData(txHash common.Hash, blockNum uint64, txIndex uint) blobSidecarsRequestData {
+	return blobSidecarsRequestData{
+		BlockNum: hexutil.Uint64(blockNum),
+		TxIndex:  hexutil.Uint(txIndex),
+		Hash:     txHash,
+	}
+}
+
+// TestSidecarReqManager_Add tests the add method
+func TestSidecarReqManager_Add(t *testing.T) {
+	cooldown := 10 * time.Second
+	maxTry := 5
+	m := newTestSidecarReqManager(cooldown, maxTry)
+
+	txHash1 := tx1.Hash()
+	txHash2 := tx2.Hash()
+	request1 := newTestBlobSidecarsRequestData(txHash1, 100, 0)
+	request2 := newTestBlobSidecarsRequestData(txHash2, 200, 1)
+
+	// Test adding a single request
+	beforeTime := time.Now()
+	m.add(txHash1, request1)
+
+	req := m.get(txHash1)
+	assert.NotNil(t, req, "Request should be added")
+	assert.Equal(t, "", req.peer, "Peer should be empty string")
+	assert.Equal(t, 0, req.try, "Try should be 0")
+	assert.Equal(t, request1, req.request, "Request data should match")
+	// Check that time is approximately cooldown ago
+	expectedTime := beforeTime.Add(-cooldown)
+	assert.True(t, req.time.After(expectedTime.Add(-100*time.Millisecond)) && req.time.Before(expectedTime.Add(100*time.Millisecond)),
+		"Time should be approximately cooldown ago")
+
+	// Test adding multiple requests
+	m.add(txHash2, request2)
+	req2 := m.get(txHash2)
+	assert.NotNil(t, req2, "Second request should be added")
+	assert.Equal(t, request2, req2.request, "Second request data should match")
+
+	// Verify both requests exist
+	assert.Equal(t, 2, len(m.list), "Should have 2 requests in the list")
+}
+
+// TestSidecarReqManager_Get tests the get method
+func TestSidecarReqManager_Get(t *testing.T) {
+	cooldown := 10 * time.Second
+	maxTry := 5
+	m := newTestSidecarReqManager(cooldown, maxTry)
+
+	txHash1 := tx1.Hash()
+	txHash2 := tx2.Hash()
+	request1 := newTestBlobSidecarsRequestData(txHash1, 100, 0)
+
+	// Test getting non-existent request
+	req := m.get(txHash1)
+	assert.Nil(t, req, "Should return nil for non-existent request")
+
+	// Test getting existing request
+	m.add(txHash1, request1)
+	req = m.get(txHash1)
+	assert.NotNil(t, req, "Should return request after adding")
+	assert.Equal(t, request1, req.request, "Request data should match")
+
+	// Test getting different hash
+	req2 := m.get(txHash2)
+	assert.Nil(t, req2, "Should return nil for different hash")
+}
+
+// TestSidecarReqManager_Update tests the update method
+func TestSidecarReqManager_Update(t *testing.T) {
+	cooldown := 10 * time.Second
+	maxTry := 5
+	m := newTestSidecarReqManager(cooldown, maxTry)
+
+	txHash := tx1.Hash()
+	request := newTestBlobSidecarsRequestData(txHash, 100, 0)
+	peerID := "test-peer-1"
+
+	// Add a request first
+	m.add(txHash, request)
+
+	// Test updating the request
+	beforeUpdate := time.Now()
+	m.update(txHash, peerID)
+	afterUpdate := time.Now()
+
+	req := m.get(txHash)
+	assert.NotNil(t, req, "Request should still exist after update")
+	assert.Equal(t, peerID, req.peer, "Peer should be updated")
+	assert.Equal(t, 1, req.try, "Try count should be incremented")
+	assert.Equal(t, request, req.request, "Request data should remain unchanged")
+	assert.True(t, req.time.After(beforeUpdate) && req.time.Before(afterUpdate.Add(100*time.Millisecond)),
+		"Time should be updated to current time")
+
+	// Test multiple updates
+	m.update(txHash, "test-peer-2")
+	req = m.get(txHash)
+	assert.Equal(t, "test-peer-2", req.peer, "Peer should be updated again")
+	assert.Equal(t, 2, req.try, "Try count should be incremented again")
+
+	// Test update that reaches maxTry boundary
+	// Current try is 2, maxTry is 5
+	// Update until we're just before maxTry
+	for i := 2; i < maxTry-1; i++ {
+		m.update(txHash, "test-peer")
+		req = m.get(txHash)
+		assert.NotNil(t, req, "Request should still exist")
+		assert.Equal(t, i+1, req.try, "Try count should increment")
+	}
+	// Verify we're at try=4 (maxTry-1)
+	req = m.get(txHash)
+	assert.NotNil(t, req, "Request should still exist at try=4")
+	assert.Equal(t, maxTry-1, req.try, "Try should be maxTry-1")
+
+	// Test update that reaches maxTry (should delete)
+	m.update(txHash, "test-peer-final")
+	req = m.get(txHash)
+	assert.Nil(t, req, "Request should be deleted when try >= maxTry")
+}
+
+// TestSidecarReqManager_UpdateNilEntry tests that update does not panic when the entry
+// has been concurrently deleted before update() acquires the lock.
+func TestSidecarReqManager_UpdateNilEntry(t *testing.T) {
+	m := newTestSidecarReqManager(10*time.Second, 5)
+	txHash := tx1.Hash()
+
+	// update on a never-added (nil) entry must not panic
+	assert.NotPanics(t, func() {
+		m.update(txHash, "peer-1")
+	}, "update on missing entry should be a no-op, not a panic")
+
+	// add, delete, then update — simulates the race: response arrives before update()
+	m.add(txHash, newTestBlobSidecarsRequestData(txHash, 100, 0))
+	m.delete(txHash)
+	assert.NotPanics(t, func() {
+		m.update(txHash, "peer-1")
+	}, "update after concurrent delete should be a no-op, not a panic")
+
+	// entry must remain absent
+	assert.Nil(t, m.get(txHash), "entry should remain deleted after no-op update")
+}
+
+// TestSidecarReqManager_Delete tests the delete method
+func TestSidecarReqManager_Delete(t *testing.T) {
+	cooldown := 10 * time.Second
+	maxTry := 5
+	m := newTestSidecarReqManager(cooldown, maxTry)
+
+	txHash1 := tx1.Hash()
+	txHash2 := tx2.Hash()
+	request1 := newTestBlobSidecarsRequestData(txHash1, 100, 0)
+	request2 := newTestBlobSidecarsRequestData(txHash2, 200, 1)
+
+	// Add requests
+	m.add(txHash1, request1)
+	m.add(txHash2, request2)
+
+	// Test deleting existing request
+	m.delete(txHash1)
+	req := m.get(txHash1)
+	assert.Nil(t, req, "Request should be deleted")
+
+	// Verify other request still exists
+	req2 := m.get(txHash2)
+	assert.NotNil(t, req2, "Other request should still exist")
+
+	// Test deleting non-existent request (should not panic)
+	m.delete(common.Hash{})
+	assert.Equal(t, 1, len(m.list), "Should still have one request")
+}
+
+// TestSidecarReqManager_Search tests the search method
+func TestSidecarReqManager_Search(t *testing.T) {
+	cooldown := 100 * time.Millisecond
+	maxTry := 5
+	m := newTestSidecarReqManager(cooldown, maxTry)
+
+	// Test empty list
+	req := m.search()
+	assert.Nil(t, req, "Should return nil for empty list")
+
+	txHash1 := tx1.Hash()
+	txHash2 := tx2.Hash()
+	txHash3 := common.BytesToHash([]byte("test-hash-3"))
+	request1 := newTestBlobSidecarsRequestData(txHash1, 100, 0)
+	request2 := newTestBlobSidecarsRequestData(txHash2, 200, 1)
+	request3 := newTestBlobSidecarsRequestData(txHash3, 300, 2)
+
+	// Test with try == 0 request (should be returned immediately)
+	m.add(txHash1, request1)
+	req = m.search()
+	assert.NotNil(t, req, "Should return request with try == 0")
+	assert.Equal(t, txHash1, req.request.Hash, "Should return the first request with try == 0")
+
+	// Add another request with try == 0
+	m.add(txHash2, request2)
+	req = m.search()
+	assert.NotNil(t, req, "Should return a request with try == 0")
+	assert.True(t, req.request.Hash == txHash1,
+		"Should return one of the requests with try == 0")
+
+	// Update one request so it has try > 0 but not expired
+	m.update(txHash1, "peer-1")
+	time.Sleep(10 * time.Millisecond) // Small delay to ensure time difference
+	req = m.search()
+	assert.NotNil(t, req, "Should return request with try == 0")
+	assert.Equal(t, txHash2, req.request.Hash, "Should return the request with try == 0")
+
+	// Wait for cooldown and test expired request
+	m.update(txHash1, "peer-2")
+	time.Sleep(cooldown + 50*time.Millisecond) // Wait for cooldown
+	req = m.search()
+	assert.NotNil(t, req, "Should return expired request")
+	assert.True(t, req.request.Hash == txHash2, "Should return one of the expired requests")
+
+	{
+		// Test with all requests having try > 0 and not expired
+		m = newTestSidecarReqManager(cooldown, maxTry)
+		m.add(txHash1, request1)
+		m.update(txHash1, "peer-1")
+		time.Sleep(10 * time.Millisecond) // Small delay but not enough for cooldown
+		req = m.search()
+		assert.Nil(t, req, "Should return nil when no valid requests exist")
+	}
+
+	{
+		// Test sorting by time (ascending order)
+		m = newTestSidecarReqManager(cooldown, maxTry)
+		m.add(txHash1, request1)
+		time.Sleep(10 * time.Millisecond)
+		m.add(txHash2, request2)
+		time.Sleep(10 * time.Millisecond)
+		m.add(txHash3, request3)
+		// All have try == 0, so should return the oldest (first added)
+		req = m.search()
+		assert.NotNil(t, req, "Should return a request")
+		assert.Equal(t, txHash1, req.request.Hash, "Should return the oldest request (first added)")
+	}
+
+	{
+		// Test with mixed scenarios: some expired, some with try == 0
+		m = newTestSidecarReqManager(cooldown, maxTry)
+		m.add(txHash1, request1) // try == 0
+		m.add(txHash2, request2)
+		m.update(txHash2, "peer-2")
+		time.Sleep(cooldown + 50*time.Millisecond) // Make txHash2 cooldown
+		req = m.search()
+		assert.NotNil(t, req, "Should return a request")
+		assert.Equal(t, txHash1, req.request.Hash, "Should prioritize try == 0 over expired")
+	}
+}
+
+// TestSidecarReqManager_Integration tests integration scenarios
+func TestSidecarReqManager_Integration(t *testing.T) {
+	cooldown := 100 * time.Millisecond
+	maxTry := 3
+	m := newTestSidecarReqManager(cooldown, maxTry)
+
+	txHash1 := tx1.Hash()
+	txHash2 := tx2.Hash()
+	txHash3 := common.BytesToHash([]byte("test-hash-3"))
+	request1 := newTestBlobSidecarsRequestData(txHash1, 100, 0)
+	request2 := newTestBlobSidecarsRequestData(txHash2, 200, 1)
+	request3 := newTestBlobSidecarsRequestData(txHash3, 300, 2)
+
+	// Scenario: Add multiple requests, search, update, search again, delete
+	m.add(txHash1, request1)
+	m.add(txHash2, request2)
+	m.add(txHash3, request3)
+
+	// Search should find one with try == 0
+	req := m.search()
+	assert.NotNil(t, req, "Should find a request")
+	originalHash := req.request.Hash
+
+	// Update the found request
+	m.update(originalHash, "peer-1")
+	req = m.get(originalHash)
+	assert.Equal(t, 1, req.try, "Try count should be 1")
+	assert.Equal(t, "peer-1", req.peer, "Peer should be updated")
+
+	// Search again - should find another request with try == 0
+	req = m.search()
+	assert.NotNil(t, req, "Should find another request")
+	assert.NotEqual(t, originalHash, req.request.Hash, "Should find a different request")
+
+	// Update until maxTry is reached (should delete)
+	// With maxTry=3, current try=1, so one more update (try=2) then another (try=3) will trigger deletion
+	m.update(originalHash, "peer-2")
+	req = m.get(originalHash)
+	assert.NotNil(t, req, "Request should still exist")
+	assert.Equal(t, 2, req.try, "Try should be 2 (maxTry-1)")
+
+	// One more update should trigger deletion
+	m.update(originalHash, "peer-3")
+	req = m.get(originalHash)
+	assert.Nil(t, req, "Request should be deleted when try >= maxTry")
+
+	// Delete remaining requests
+	m.delete(txHash2)
+	m.delete(txHash3)
+	req = m.search()
+	assert.Nil(t, req, "Should return nil when all requests are deleted")
+
+	// Scenario: Add, wait for cooldown, search should find expired request
+	m.add(txHash1, request1)
+	m.update(txHash1, "peer-1")
+	time.Sleep(cooldown + 50*time.Millisecond)
+	req = m.search()
+	assert.NotNil(t, req, "Should find expired request")
+	assert.Equal(t, txHash1, req.request.Hash, "Should find the expired request")
+}

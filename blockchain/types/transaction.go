@@ -1,0 +1,1292 @@
+// Modifications Copyright 2024 The Kaia Authors
+// Modifications Copyright 2018 The klaytn Authors
+// Copyright 2015 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+//
+// This file is derived from core/types/transaction.go (2018/06/04).
+// Modified and improved for the klaytn development.
+// Modified and improved for the Kaia development.
+
+package types
+
+import (
+	"bytes"
+	"container/heap"
+	"crypto/ecdsa"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"math/big"
+	"sort"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/kaiachain/kaia/blockchain/types/accountkey"
+	"github.com/kaiachain/kaia/common"
+	"github.com/kaiachain/kaia/common/math"
+	"github.com/kaiachain/kaia/crypto"
+	"github.com/kaiachain/kaia/kerrors"
+	"github.com/kaiachain/kaia/params"
+	"github.com/kaiachain/kaia/rlp"
+)
+
+var (
+	ErrInvalidSig                     = errors.New("invalid transaction v, r, s values")
+	ErrInvalidSigSender               = errors.New("invalid transaction v, r, s values of the sender")
+	ErrInvalidSigFeePayer             = errors.New("invalid transaction v, r, s values of the fee payer")
+	ErrInvalidSignatureCount          = errors.New("invalid number of transaction signatures")
+	ErrInvalidTxTypeForAnchoredData   = errors.New("invalid transaction type for anchored data")
+	ErrNotLegacyAccount               = errors.New("not a legacy account")
+	ErrInvalidAccountKey              = errors.New("invalid account key")
+	errLegacyTransaction              = errors.New("should not be called by a legacy transaction")
+	errNotImplementTxInternalDataFrom = errors.New("not implement TxInternalDataFrom")
+	errNotFeeDelegationTransaction    = errors.New("not a fee delegation type transaction")
+	errInvalidValueMap                = errors.New("tx fields should be filled with valid values")
+	errNotImplementTxInternalEthTyped = errors.New("not implement TxInternalDataEthTyped")
+)
+
+// deriveSigner makes a *best* guess about which signer to use.
+func deriveSigner(V *big.Int) Signer {
+	return LatestSignerForChainID(deriveChainId(V))
+}
+
+// errSingleSignatureOnly reports that a single-signature transaction type was
+// given a signature list of the wrong length.
+func errSingleSignatureOnly(txType TxType, got int) error {
+	return fmt.Errorf("%w: %s accepts exactly one signature, got %d", ErrInvalidSignatureCount, txType, got)
+}
+
+func ErrSender(err error) error {
+	return fmt.Errorf("invalid sender: %s", err)
+}
+
+func ErrFeePayer(err error) error {
+	return fmt.Errorf("invalid fee payer: %s", err)
+}
+
+// ValidatedGas holds the intrinsic gas, sig validation gas, and data tokens.
+//   - Intrinsic gas is the gas for the tx type + signature validation + data.
+//     After Prague, floor gas would be used if intrinsic gas < floor gas.
+//     Note that SigValidationGas is already included in IntrinsicGas.
+//   - Sig validation gas is the gas for validating sender and feePayer.
+//     It is related to Kaia-specific tx types, so it is not part of the floor gas comparison.
+type ValidatedGas struct {
+	IntrinsicGas   uint64
+	SigValidateGas uint64
+}
+
+type Transaction struct {
+	data TxInternalData
+	time time.Time
+	// caches
+	hash         atomic.Pointer[common.Hash]
+	size         atomic.Uint64
+	from         atomic.Value
+	feePayer     atomic.Value
+	senderTxHash atomic.Value
+
+	// validatedSender represents the sender of the transaction to be used for ApplyTransaction().
+	// This value is set in AsMessageWithAccountKeyPicker().
+	validatedSender common.Address
+	// validatedFeePayer represents the fee payer of the transaction to be used for ApplyTransaction().
+	// This value is set in AsMessageWithAccountKeyPicker().
+	validatedFeePayer common.Address
+	// validatedGas holds intrinsic gas, sig validation gas, and number of tokens for the transaction to be used for ApplyTransaction().
+	// This value is set in AsMessageWithAccountKeyPicker().
+	validatedGas *ValidatedGas
+	// The account's nonce is checked only if `checkNonce` is true.
+	checkNonce bool
+	// This value is set when the tx is invalidated in block tx validation, and is used to remove pending tx in txPool.
+	markedUnexecutable atomic.Int32
+
+	// lock for protecting fields in Transaction struct
+	mu sync.RWMutex
+}
+
+// NewTransactionWithMap generates a tx from tx field values.
+// One of the return value, retErr, is lastly updated when panic is occurred.
+func NewTransactionWithMap(t TxType, values map[TxValueKeyType]interface{}) (tx *Transaction, retErr error) {
+	defer func() {
+		if err := recover(); err != nil {
+			logger.Warn("Got panic and recovered", "panicErr", err)
+			retErr = errInvalidValueMap
+		}
+	}()
+	txData, err := NewTxInternalDataWithMap(t, values)
+	if err != nil {
+		return nil, err
+	}
+	tx = NewTx(txData)
+	return tx, retErr
+}
+
+// NewTx creates a new transaction.
+func NewTx(data TxInternalData) *Transaction {
+	tx := new(Transaction)
+	tx.setDecoded(data, 0)
+
+	return tx
+}
+
+func NewTransaction(nonce uint64, to common.Address, amount *big.Int, gasLimit uint64, gasPrice *big.Int, data []byte) *Transaction {
+	return newTransaction(nonce, &to, amount, gasLimit, gasPrice, data)
+}
+
+func NewContractCreation(nonce uint64, amount *big.Int, gasLimit uint64, gasPrice *big.Int, data []byte) *Transaction {
+	return newTransaction(nonce, nil, amount, gasLimit, gasPrice, data)
+}
+
+func newTransaction(nonce uint64, to *common.Address, amount *big.Int, gasLimit uint64, gasPrice *big.Int, data []byte) *Transaction {
+	if len(data) > 0 {
+		data = common.CopyBytes(data)
+	}
+	d := TxInternalDataLegacy{
+		AccountNonce: nonce,
+		Recipient:    to,
+		Payload:      data,
+		Amount:       new(big.Int),
+		GasLimit:     gasLimit,
+		Price:        new(big.Int),
+		V:            new(big.Int),
+		R:            new(big.Int),
+		S:            new(big.Int),
+	}
+	if amount != nil {
+		d.Amount.Set(amount)
+	}
+	if gasPrice != nil {
+		d.Price.Set(gasPrice)
+	}
+
+	return NewTx(&d)
+}
+
+// ChainId returns which chain id this transaction was signed for (if at all)
+func (tx *Transaction) ChainId() *big.Int {
+	return tx.data.ChainId()
+}
+
+// SenderTxHash returns (SenderTxHash, true) if the tx is a fee-delegated transaction.
+// Otherwise, it returns (nil hash, false).
+func (tx *Transaction) SenderTxHash() (common.Hash, bool) {
+	tf, isFeeDelegated := tx.data.(TxInternalDataFeePayer)
+	if !isFeeDelegated {
+		// Do not compute SenderTxHash for non-fee-delegated txs
+		return common.Hash{}, isFeeDelegated
+	}
+	if senderTxHash := tx.senderTxHash.Load(); senderTxHash != nil {
+		return senderTxHash.(common.Hash), isFeeDelegated
+	}
+	v := tf.SenderTxHash()
+	tx.senderTxHash.Store(v)
+	return v, isFeeDelegated
+}
+
+// SenderTxHashAll returns SenderTxHash for all tx types.
+// If it is not a fee-delegated tx, SenderTxHash and TxHash are the same.
+func (tx *Transaction) SenderTxHashAll() common.Hash {
+	if senderTxHash := tx.senderTxHash.Load(); senderTxHash != nil {
+		return senderTxHash.(common.Hash)
+	}
+
+	var v common.Hash
+	if tf, ok := tx.data.(TxInternalDataFeePayer); ok {
+		v = tf.SenderTxHash()
+	} else {
+		v = tx.Hash()
+	}
+	tx.senderTxHash.Store(v)
+	return v
+}
+
+func validateSignature(v, r, s *big.Int) bool {
+	// TODO-Kaia: Need to consider the case v.BitLen() > 64.
+	// Since ValidateSignatureValues receives v as type of byte, leave it as a future work.
+	if v != nil && !isProtectedV(v) {
+		return crypto.ValidateSignatureValues(byte(v.Uint64()-27), r, s, true)
+	}
+
+	chainID := deriveChainId(v).Uint64()
+	V := byte(v.Uint64() - 35 - 2*chainID)
+
+	return crypto.ValidateSignatureValues(V, r, s, false)
+}
+
+// EncodeRLP implements rlp.Encoder
+func (tx *Transaction) EncodeRLP(w io.Writer) error {
+	serializer := newTxInternalDataSerializerWithValues(tx.data)
+	return rlp.Encode(w, serializer)
+}
+
+// MarshalBinary returns the canonical encoding of the transaction.
+// For legacy transactions, it returns the RLP encoding. For typed
+// transactions, it returns the type and payload.
+func (tx *Transaction) MarshalBinary() ([]byte, error) {
+	var buf bytes.Buffer
+	err := tx.EncodeRLP(&buf)
+	return buf.Bytes(), err
+}
+
+// DecodeRLP implements rlp.Decoder
+func (tx *Transaction) DecodeRLP(s *rlp.Stream) error {
+	serializer := newTxInternalDataSerializer()
+	if err := s.Decode(serializer); err != nil {
+		return err
+	}
+
+	if !SanityCheckSignatures(serializer.tx.RawSignatureValues(), serializer.tx.Type()) {
+		return ErrInvalidSig
+	}
+
+	size := calculateTxSize(serializer.tx)
+	tx.setDecoded(serializer.tx, int(size))
+
+	return nil
+}
+
+// UnmarshalBinary decodes the canonical encoding of transactions.
+// It supports legacy RLP transactions and EIP2718 typed transactions.
+func (tx *Transaction) UnmarshalBinary(b []byte) error {
+	newTx := &Transaction{}
+	if err := rlp.DecodeBytes(b, newTx); err != nil {
+		return err
+	}
+
+	tx.setDecoded(newTx.data, len(b))
+	return nil
+}
+
+// MarshalJSON encodes the web3 RPC transaction format.
+func (tx *Transaction) MarshalJSON() ([]byte, error) {
+	hash := tx.Hash()
+	data := tx.data
+	data.setHashForMarshaling(&hash)
+	serializer := newTxInternalDataSerializerWithValues(tx.data)
+	return json.Marshal(serializer)
+}
+
+// UnmarshalJSON decodes the web3 RPC transaction format.
+func (tx *Transaction) UnmarshalJSON(input []byte) error {
+	serializer := newTxInternalDataSerializer()
+	if err := json.Unmarshal(input, serializer); err != nil {
+		return err
+	}
+	if !SanityCheckSignatures(serializer.tx.RawSignatureValues(), serializer.tx.Type()) {
+		return ErrInvalidSig
+	}
+
+	tx.setDecoded(serializer.tx, 0)
+	return nil
+}
+
+func (tx *Transaction) setDecoded(inner TxInternalData, size int) {
+	tx.data = inner
+	tx.time = time.Now()
+
+	if size > 0 {
+		tx.size.Store(uint64(size))
+	}
+}
+
+func (tx *Transaction) Gas() uint64        { return tx.data.GetGasLimit() }
+func (tx *Transaction) GasPrice() *big.Int { return new(big.Int).Set(tx.data.GetGasPrice()) }
+func (tx *Transaction) GasTipCap() *big.Int {
+	if te, ok := tx.GetTxInternalData().(TxInternalDataBaseFee); ok {
+		return te.GetGasTipCap()
+	}
+
+	return tx.data.GetGasPrice()
+}
+
+func (tx *Transaction) GasFeeCap() *big.Int {
+	if te, ok := tx.GetTxInternalData().(TxInternalDataBaseFee); ok {
+		return te.GetGasFeeCap()
+	}
+
+	return tx.data.GetGasPrice()
+}
+
+func (tx *Transaction) EffectiveGasTip(baseFee *big.Int) *big.Int {
+	// effectiveGasPrice - baseFee = min(baseFee + tipCap, feeCap) - baseFee = min(tipCap, feeCap - baseFee)
+	if baseFee != nil {
+		// For EthereumDynamicFee TxType: min(GasTipCap, Sub(GasFeeCap,baseFee))
+		// For Non-EthereumDynamicFee TxType: min(GasPrice, Sub(gasPrice, baseFee)
+		tip := math.BigMax(big.NewInt(0), new(big.Int).Sub(tx.GasFeeCap(), baseFee))
+		return math.BigMin(tx.GasTipCap(), tip)
+	}
+
+	return new(big.Int).Set(tx.GasTipCap())
+}
+
+func (tx *Transaction) EffectiveGasPrice(header *Header, config *params.ChainConfig) *big.Int {
+	if header == nil || header.BaseFee == nil {
+		return new(big.Int).Set(tx.GasPrice())
+	}
+	if config.Rules(header.Number).IsKaia {
+		tip := tx.EffectiveGasTip(header.BaseFee)
+		return new(big.Int).Add(tip, header.BaseFee)
+	}
+	return new(big.Int).Set(header.BaseFee)
+}
+
+func (tx *Transaction) AccessList() AccessList {
+	if te, ok := tx.GetTxInternalData().(TxInternalDataAccessList); ok {
+		return te.GetAccessList()
+	}
+	return nil
+}
+
+// BlobGas returns the blob gas limit of the transaction for blob transactions, 0 otherwise.
+func (tx *Transaction) BlobGas() uint64 {
+	if blobTx, ok := tx.GetTxInternalData().(*TxInternalDataEthereumBlob); ok {
+		return blobTx.GetBlobGas()
+	}
+	return 0
+}
+
+// BlobGasFeeCap returns the blob gas fee cap per blob gas of the transaction for blob transactions, nil otherwise.
+func (tx *Transaction) BlobGasFeeCap() *big.Int {
+	if blobTx, ok := tx.GetTxInternalData().(*TxInternalDataEthereumBlob); ok {
+		return new(big.Int).Set(blobTx.BlobFeeCap.ToBig())
+	}
+	return nil
+}
+
+// BlobHashes returns the hashes of the blob commitments for blob transactions, nil otherwise.
+func (tx *Transaction) BlobHashes() []common.Hash {
+	if blobTx, ok := tx.GetTxInternalData().(*TxInternalDataEthereumBlob); ok {
+		return blobTx.BlobHashes
+	}
+	return nil
+}
+
+// BlobTxSidecar returns the sidecar of a blob transaction, nil otherwise.
+func (tx *Transaction) BlobTxSidecar() *BlobTxSidecar {
+	if blobTx, ok := tx.GetTxInternalData().(*TxInternalDataEthereumBlob); ok {
+		return blobTx.Sidecar
+	}
+	return nil
+}
+
+// BlobGasFeeCapCmp compares the blob fee cap of two transactions.
+func (tx *Transaction) BlobGasFeeCapCmp(other *Transaction) int {
+	return tx.BlobGasFeeCap().Cmp(other.BlobGasFeeCap())
+}
+
+// BlobGasFeeCapIntCmp compares the blob fee cap of the transaction against the given blob fee cap.
+func (tx *Transaction) BlobGasFeeCapIntCmp(other *big.Int) int {
+	return tx.BlobGasFeeCap().Cmp(other)
+}
+
+// WithoutBlobTxSidecar returns a copy of tx with the blob sidecar removed.
+func (tx *Transaction) WithoutBlobTxSidecar() *Transaction {
+	blobtx, ok := tx.GetTxInternalData().(*TxInternalDataEthereumBlob)
+	if !ok {
+		return tx
+	}
+	if blobtx.Sidecar == nil {
+		return tx
+	}
+	cpy := &Transaction{
+		data: blobtx.withoutSidecar(),
+		time: tx.time,
+	}
+	if size := tx.size.Load(); size != 0 {
+		// The tx had a sidecar before, so we need to subtract it from the size.
+		scSize := rlp.ListSize(blobtx.Sidecar.encodedSize())
+		cpy.size.Store(size - scSize)
+	}
+	if h := tx.hash.Load(); h != nil {
+		cpy.hash.Store(h)
+	}
+	if f := tx.from.Load(); f != nil {
+		cpy.from.Store(f)
+	}
+	return cpy
+}
+
+// WithBlobTxSidecar returns a copy of tx with the blob sidecar added.
+func (tx *Transaction) WithBlobTxSidecar(sideCar *BlobTxSidecar) *Transaction {
+	blobtx, ok := tx.GetTxInternalData().(*TxInternalDataEthereumBlob)
+	if !ok {
+		return tx
+	}
+	cpy := &Transaction{
+		data: blobtx.withSidecar(sideCar),
+		time: tx.time,
+	}
+	// Note: tx.size cache not carried over because the sidecar is included in size!
+	if h := tx.hash.Load(); h != nil {
+		cpy.hash.Store(h)
+	}
+	if f := tx.from.Load(); f != nil {
+		cpy.from.Store(f)
+	}
+	return cpy
+}
+
+func (tx *Transaction) AuthList() []SetCodeAuthorization {
+	if tx.Type() == TxTypeEthereumSetCode {
+		te := tx.GetTxInternalData().(*TxInternalDataEthereumSetCode)
+		return te.GetAuthorizationList()
+	}
+	return nil
+}
+
+// SetCodeAuthorities returns a list of unique authorities from the
+// authorization list.
+func (tx *Transaction) SetCodeAuthorities() []common.Address {
+	if tx.Type() != TxTypeEthereumSetCode {
+		return nil
+	}
+	var (
+		marks = make(map[common.Address]bool)
+		auths = make([]common.Address, 0, len(tx.AuthList()))
+	)
+	for _, auth := range tx.AuthList() {
+		if addr, err := auth.Authority(); err == nil {
+			if marks[addr] {
+				continue
+			}
+			marks[addr] = true
+			auths = append(auths, addr)
+		}
+	}
+	return auths
+}
+
+func (tx *Transaction) Value() *big.Int { return new(big.Int).Set(tx.data.GetValue()) }
+func (tx *Transaction) Nonce() uint64   { return tx.data.GetNonce() }
+func (tx *Transaction) CheckNonce() bool {
+	tx.mu.RLock()
+	defer tx.mu.RUnlock()
+	return tx.checkNonce
+}
+func (tx *Transaction) Type() TxType                { return tx.data.Type() }
+func (tx *Transaction) IsLegacyTransaction() bool   { return tx.Type().IsLegacyTransaction() }
+func (tx *Transaction) IsEthTypedTransaction() bool { return tx.Type().IsEthTypedTransaction() }
+func (tx *Transaction) IsEthereumTransaction() bool {
+	return tx.Type().IsEthereumTransaction()
+}
+
+func isProtectedV(V *big.Int) bool {
+	if V.BitLen() <= 8 {
+		v := V.Uint64()
+		return v != 27 && v != 28 && v != 1 && v != 0
+	}
+	// anything not 27 or 28 is considered protected
+	return true
+}
+
+// Protected says whether the transaction is replay-protected.
+func (tx *Transaction) Protected() bool {
+	if tx.IsLegacyTransaction() {
+		v := tx.RawSignatureValues()[0].V
+		return v != nil && isProtectedV(v)
+	}
+	return true
+}
+
+func (tx *Transaction) ValidatedSender() common.Address {
+	tx.mu.RLock()
+	defer tx.mu.RUnlock()
+	return tx.validatedSender
+}
+
+func (tx *Transaction) ValidatedFeePayer() common.Address {
+	tx.mu.RLock()
+	defer tx.mu.RUnlock()
+	return tx.validatedFeePayer
+}
+
+func (tx *Transaction) ValidatedGas() *ValidatedGas {
+	tx.mu.RLock()
+	defer tx.mu.RUnlock()
+	return tx.validatedGas
+}
+func (tx *Transaction) MakeRPCOutput() map[string]interface{} { return tx.data.MakeRPCOutput() }
+func (tx *Transaction) GetTxInternalData() TxInternalData     { return tx.data }
+
+func (tx *Transaction) IntrinsicGas(currentBlockNumber uint64) (uint64, error) {
+	return tx.data.IntrinsicGas(currentBlockNumber)
+}
+
+func (tx *Transaction) Validate(db StateDB, signer Signer, currentBlockNumber uint64, checkMutableValue bool) error {
+	// validate the sender's account key
+	if checkMutableValue {
+		accKey := db.GetKey(tx.ValidatedSender())
+		if tx.IsEthereumTransaction() {
+			if !accKey.Type().IsLegacyAccountKey() {
+				return ErrNotLegacyAccount
+			}
+		} else {
+			if pubkey, err := SenderPubkey(signer, tx); err != nil {
+				return ErrInvalidSigSender
+			} else if accountkey.ValidateAccountKey(currentBlockNumber, tx.ValidatedSender(), accKey, pubkey, GetRoleTypeForValidation(tx.Type())) != nil {
+				return ErrInvalidAccountKey
+			}
+		}
+
+		// validate the fee payer's account key
+		if tx.IsFeeDelegatedTransaction() {
+			feePayerAccKey := db.GetKey(tx.ValidatedFeePayer())
+			if feePayerPubkey, err := SenderFeePayerPubkey(signer, tx); err != nil {
+				return ErrInvalidSigFeePayer
+			} else if accountkey.ValidateAccountKey(currentBlockNumber, tx.ValidatedFeePayer(), feePayerAccKey, feePayerPubkey, accountkey.RoleFeePayer) != nil {
+				return ErrInvalidAccountKey
+			}
+		}
+	}
+	// Range-check the fee ratio on the consensus path.
+	if feeRatio, isRatioTx := tx.FeeRatio(); isRatioTx && !feeRatio.IsValid() {
+		return kerrors.ErrFeeRatioOutOfRange
+	}
+	return tx.data.Validate(db, currentBlockNumber, checkMutableValue)
+}
+
+func (tx *Transaction) Data() []byte {
+	return common.CopyBytes(tx.data.GetData())
+}
+
+// IsFeeDelegatedTransaction returns true if the transaction is a fee-delegated transaction.
+// A fee-delegated transaction has an address of the fee payer which can be different from `from` of the tx.
+func (tx *Transaction) IsFeeDelegatedTransaction() bool {
+	_, ok := tx.data.(TxInternalDataFeePayer)
+
+	return ok
+}
+
+// AnchoredData returns the anchored data of the chain data anchoring transaction.
+// if the tx is not chain data anchoring transaction, it will return error.
+func (tx *Transaction) AnchoredData() ([]byte, error) {
+	switch tx.Type() {
+	case TxTypeChainDataAnchoring:
+		txData, ok := tx.data.(*TxInternalDataChainDataAnchoring)
+		if ok {
+			return txData.Payload, nil
+		}
+	case TxTypeFeeDelegatedChainDataAnchoring:
+		txData, ok := tx.data.(*TxInternalDataFeeDelegatedChainDataAnchoring)
+		if ok {
+			return txData.Payload, nil
+		}
+	case TxTypeFeeDelegatedChainDataAnchoringWithRatio:
+		txData, ok := tx.data.(*TxInternalDataFeeDelegatedChainDataAnchoringWithRatio)
+		if ok {
+			return txData.Payload, nil
+		}
+	}
+	return []byte{}, ErrInvalidTxTypeForAnchoredData
+}
+
+// To returns the recipient address of the transaction.
+// It returns nil if the transaction is a contract creation.
+func (tx *Transaction) To() *common.Address {
+	if tx.data.GetTo() == nil {
+		return nil
+	}
+	to := *tx.data.GetTo()
+	return &to
+}
+
+// From returns the from address of the transaction.
+// Since a legacy transaction (TxInternalDataLegacy) does not have the field `from`,
+// calling From() is failed for `TxInternalDataLegacy`.
+func (tx *Transaction) From() (common.Address, error) {
+	if tx.IsEthereumTransaction() {
+		return common.Address{}, errLegacyTransaction
+	}
+
+	tf, ok := tx.data.(TxInternalDataFrom)
+	if !ok {
+		return common.Address{}, errNotImplementTxInternalDataFrom
+	}
+
+	return tf.GetFrom(), nil
+}
+
+// FeePayer returns the fee payer address.
+// If the tx is a fee-delegated transaction, it returns the specified fee payer.
+// Otherwise, it returns `from` of the tx.
+func (tx *Transaction) FeePayer() (common.Address, error) {
+	tf, ok := tx.data.(TxInternalDataFeePayer)
+	if !ok {
+		// if the tx is not a fee-delegated transaction, the fee payer is `from` of the tx.
+		return tx.From()
+	}
+
+	return tf.GetFeePayer(), nil
+}
+
+// FeeRatio returns the fee ratio of a transaction and a boolean value indicating TxInternalDataFeeRatio implementation.
+// If the transaction does not implement TxInternalDataFeeRatio,
+// it returns MaxFeeRatio which means the fee payer will be paid all tx fee by default.
+func (tx *Transaction) FeeRatio() (FeeRatio, bool) {
+	tf, ok := tx.data.(TxInternalDataFeeRatio)
+	if !ok {
+		// default fee ratio is MaxFeeRatio.
+		return MaxFeeRatio, ok
+	}
+
+	return tf.GetFeeRatio(), ok
+}
+
+// Hash hashes the RLP encoding of tx.
+// It uniquely identifies the transaction.
+func (tx *Transaction) Hash() common.Hash {
+	if hash := tx.hash.Load(); hash != nil {
+		return *hash
+	}
+
+	var v common.Hash
+	if tx.IsEthTypedTransaction() {
+		te := tx.data.(TxInternalDataEthTyped)
+		v = te.EthTxHash()
+	} else {
+		v = rlpHash(tx)
+	}
+
+	tx.hash.Store(&v)
+	return v
+}
+
+// Size returns the true RLP encoded storage size of the transaction, either by
+// encoding and returning it, or returning a previsouly cached value.
+func (tx *Transaction) Size() common.StorageSize {
+	if size := tx.size.Load(); size > 0 {
+		return common.StorageSize(size)
+	}
+
+	// Unlike eth, each tx type in Kaia implements EncodeRLP/DecodeRLP when it has its own encode/decode.
+	// Therefore, all sizes are included in the result as rlp.Encode calls it. e.g) sidecar
+	size := calculateTxSize(tx.data)
+	tx.size.Store(uint64(size))
+
+	return size
+}
+
+// SizeWithoutBlobTxSidecar returns the true RLP encoded storage size of the transaction
+// without the blob sidecar.
+func (tx *Transaction) SizeWithoutBlobTxSidecar() common.StorageSize {
+	size := tx.Size()
+	if sc := tx.BlobTxSidecar(); sc != nil {
+		size -= common.StorageSize(rlp.ListSize(sc.encodedSize()))
+	}
+	return size
+}
+
+func (tx *Transaction) SetTime(t time.Time) {
+	tx.time = t
+}
+
+// Time returns the time that transaction was created.
+func (tx *Transaction) Time() time.Time {
+	return tx.time
+}
+
+// Execute performs execution of the transaction. This function will be called from StateTransition.TransitionDb().
+// Since each transaction type performs different execution, this function calls TxInternalData.TransitionDb().
+func (tx *Transaction) Execute(vm VM, stateDB StateDB, currentBlockNumber uint64, gas uint64, value *big.Int) ([]byte, uint64, error) {
+	sender := NewAccountRefWithFeePayer(tx.ValidatedSender(), tx.ValidatedFeePayer())
+	return tx.data.Execute(sender, vm, stateDB, currentBlockNumber, gas, value)
+}
+
+// AsMessageWithAccountKeyPicker returns the transaction as a blockchain.Message.
+//
+// AsMessageWithAccountKeyPicker requires a signer to derive the sender and AccountKeyPicker.
+//
+// XXX Rename message to something less arbitrary?
+// TODO-Kaia: Message is removed and this function will return *Transaction.
+func (tx *Transaction) AsMessageWithAccountKeyPicker(s Signer, picker AccountKeyPicker, currentBlockNumber uint64) (*Transaction, error) {
+	intrinsicGas, err := tx.IntrinsicGas(currentBlockNumber)
+	if err != nil {
+		return nil, err
+	}
+
+	gasFrom, err := tx.ValidateSender(s, picker, currentBlockNumber)
+	if err != nil {
+		return nil, ErrSender(err)
+	}
+
+	tx.mu.Lock()
+	tx.checkNonce = true
+	tx.mu.Unlock()
+
+	gasFeePayer := uint64(0)
+	if tx.IsFeeDelegatedTransaction() {
+		gasFeePayer, err = tx.ValidateFeePayer(s, picker, currentBlockNumber)
+		if err != nil {
+			return nil, ErrFeePayer(err)
+		}
+	}
+
+	sigValidationGas := gasFrom + gasFeePayer
+	intrinsicGas = intrinsicGas + sigValidationGas
+
+	tx.mu.Lock()
+	tx.validatedGas = &ValidatedGas{IntrinsicGas: intrinsicGas, SigValidateGas: sigValidationGas}
+	tx.mu.Unlock()
+
+	return tx, err
+}
+
+// WithSignature returns a new transaction with the given signature.
+// This signature needs to be formatted as described in the yellow paper (v+27).
+func (tx *Transaction) WithSignature(signer Signer, sig []byte) (*Transaction, error) {
+	r, s, v, err := signer.SignatureValues(tx, sig)
+	if err != nil {
+		return nil, err
+	}
+
+	cpy := &Transaction{data: tx.data, time: tx.time}
+
+	// Legacy transaction: v = (27 or 28) or EIP-155 (chainId * 2 + 35 + yParity)
+	// Kaia typed transaction: v = EIP-155 (chainId * 2 + 35 + yParity)
+	// Eth typed transaction: v = yParity (0 or 1) and separate chainId field
+	// Therefore, EIP-2718 Eth typed transactions must be supplied with the chainId field.
+	if te, ok := cpy.data.(TxInternalDataEthTyped); ok {
+		te.SetChainId(signer.ChainID())
+	}
+
+	if err := cpy.data.SetSignature(TxSignatures{&TxSignature{v, r, s}}); err != nil {
+		return nil, err
+	}
+	return cpy, nil
+}
+
+// WithFeePayerSignature returns a new transaction with the given fee payer signature.
+func (tx *Transaction) WithFeePayerSignature(signer Signer, sig []byte) (*Transaction, error) {
+	r, s, v, err := signer.SignatureValues(tx, sig)
+	if err != nil {
+		return nil, err
+	}
+
+	cpy := &Transaction{data: tx.data, time: tx.time}
+
+	feePayerSig := TxSignatures{&TxSignature{v, r, s}}
+	if err := cpy.SetFeePayerSignatures(feePayerSig); err != nil {
+		return nil, err
+	}
+	return cpy, nil
+}
+
+// Cost returns the maximum transaction cost.
+func (tx *Transaction) Cost() *big.Int {
+	total := tx.Fee()
+	if blobFeeCap := tx.BlobGasFeeCap(); blobFeeCap != nil {
+		blobFee := new(big.Int).Mul(new(big.Int).SetUint64(tx.BlobGas()), blobFeeCap)
+		total.Add(total, blobFee)
+	}
+	total.Add(total, tx.data.GetValue())
+	return total
+}
+
+func (tx *Transaction) Fee() *big.Int {
+	return new(big.Int).Mul(tx.data.GetGasPrice(), new(big.Int).SetUint64(tx.data.GetGasLimit()))
+}
+
+// Sign signs the tx with the given signer and private key.
+func (tx *Transaction) Sign(s Signer, prv *ecdsa.PrivateKey) error {
+	h := s.Hash(tx)
+	sig, err := NewTxSignatureWithValues(s, tx, h, prv)
+	if err != nil {
+		return err
+	}
+
+	return tx.SetSignature(TxSignatures{sig})
+}
+
+// SignWithKeys signs the tx with the given signer and a slice of private keys.
+func (tx *Transaction) SignWithKeys(s Signer, prv []*ecdsa.PrivateKey) error {
+	h := s.Hash(tx)
+	sig, err := NewTxSignaturesWithValues(s, tx, h, prv)
+	if err != nil {
+		return err
+	}
+
+	return tx.SetSignature(sig)
+}
+
+// SignFeePayer signs the tx with the given signer and private key as a fee payer.
+func (tx *Transaction) SignFeePayer(s Signer, prv *ecdsa.PrivateKey) error {
+	h, err := s.HashFeePayer(tx)
+	if err != nil {
+		return err
+	}
+	sig, err := NewTxSignatureWithValues(s, tx, h, prv)
+	if err != nil {
+		return err
+	}
+
+	if err := tx.SetFeePayerSignatures(TxSignatures{sig}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// SignFeePayerWithKeys signs the tx with the given signer and a slice of private keys as a fee payer.
+func (tx *Transaction) SignFeePayerWithKeys(s Signer, prv []*ecdsa.PrivateKey) error {
+	h, err := s.HashFeePayer(tx)
+	if err != nil {
+		return err
+	}
+	sig, err := NewTxSignaturesWithValues(s, tx, h, prv)
+	if err != nil {
+		return err
+	}
+
+	if err := tx.SetFeePayerSignatures(sig); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (tx *Transaction) SetFeePayerSignatures(s TxSignatures) error {
+	tf, ok := tx.data.(TxInternalDataFeePayer)
+	if !ok {
+		return errNotFeeDelegationTransaction
+	}
+
+	tf.SetFeePayerSignatures(s)
+
+	return nil
+}
+
+// GetFeePayerSignatures returns fee payer signatures of the transaction.
+func (tx *Transaction) GetFeePayerSignatures() (TxSignatures, error) {
+	tf, ok := tx.data.(TxInternalDataFeePayer)
+	if !ok {
+		return nil, errNotFeeDelegationTransaction
+	}
+	return tf.GetFeePayerRawSignatureValues(), nil
+}
+
+// SetSignature sets the sender signatures of the transaction. If the underlying
+// transaction type cannot hold the given number of signatures it returns an error
+// wrapping ErrInvalidSignatureCount (check with errors.Is).
+func (tx *Transaction) SetSignature(signature TxSignatures) error {
+	return tx.data.SetSignature(signature)
+}
+
+func (tx *Transaction) MarkUnexecutable(b bool) {
+	v := int32(0)
+	if b {
+		v = 1
+	}
+	tx.markedUnexecutable.Store(v)
+}
+
+func (tx *Transaction) IsMarkedUnexecutable() bool {
+	return tx.markedUnexecutable.Load() == 1
+}
+
+func (tx *Transaction) RawSignatureValues() TxSignatures {
+	return tx.data.RawSignatureValues()
+}
+
+// ValidateSignatureListLength checks the signature-list limit applied to
+// untrusted transaction ingress. It must not be used while decoding or
+// executing blocks because pre-Istanbul blocks may contain longer lists.
+func (tx *Transaction) ValidateSignatureListLength() error {
+	if uint64(len(tx.RawSignatureValues())) > accountkey.MaxNumKeysForMultiSig {
+		return kerrors.ErrMaxKeysExceed
+	}
+
+	if feePayerTx, ok := tx.data.(TxInternalDataFeePayer); ok && uint64(len(feePayerTx.GetFeePayerRawSignatureValues())) > accountkey.MaxNumKeysForMultiSig {
+		return kerrors.ErrMaxKeysExceed
+	}
+
+	return nil
+}
+
+func (tx *Transaction) String() string {
+	b, _ := json.Marshal(tx)
+	return string(b)
+}
+
+// ValidateSender finds a sender from both legacy and new types of transactions.
+// It returns the senders address and gas used for the tx validation.
+func (tx *Transaction) ValidateSender(signer Signer, p AccountKeyPicker, currentBlockNumber uint64) (uint64, error) {
+	if tx.IsEthereumTransaction() {
+		addr, err := Sender(signer, tx)
+		// Legacy transaction cannot be executed unless the account has a legacy key.
+		if p.GetKey(addr).Type().IsLegacyAccountKey() == false {
+			return 0, kerrors.ErrLegacyTransactionMustBeWithLegacyKey
+		}
+		tx.mu.Lock()
+		if tx.validatedSender == (common.Address{}) {
+			tx.validatedSender = addr
+			tx.validatedFeePayer = addr
+		}
+		tx.mu.Unlock()
+		return 0, err
+	}
+
+	pubkey, err := SenderPubkey(signer, tx)
+	if err != nil {
+		return 0, err
+	}
+	txfrom, ok := tx.data.(TxInternalDataFrom)
+	if !ok {
+		return 0, errNotTxInternalDataFrom
+	}
+	from := txfrom.GetFrom()
+	accKey := p.GetKey(from)
+
+	gasKey, err := accKey.SigValidationGas(currentBlockNumber, GetRoleTypeForValidation(tx.Type()), len(pubkey))
+	if err != nil {
+		return 0, err
+	}
+
+	if err := accountkey.ValidateAccountKey(currentBlockNumber, from, accKey, pubkey, GetRoleTypeForValidation(tx.Type())); err != nil {
+		return 0, ErrInvalidAccountKey
+	}
+
+	tx.mu.Lock()
+	if tx.validatedSender == (common.Address{}) {
+		tx.validatedSender = from
+		tx.validatedFeePayer = from
+	}
+	tx.mu.Unlock()
+
+	return gasKey, nil
+}
+
+// ValidateFeePayer finds a fee payer from a transaction.
+// If the transaction is not a fee-delegated transaction, it returns an error.
+func (tx *Transaction) ValidateFeePayer(signer Signer, p AccountKeyPicker, currentBlockNumber uint64) (uint64, error) {
+	tf, ok := tx.data.(TxInternalDataFeePayer)
+	if !ok {
+		return 0, errUndefinedTxType
+	}
+
+	pubkey, err := SenderFeePayerPubkey(signer, tx)
+	if err != nil {
+		return 0, err
+	}
+
+	feePayer := tf.GetFeePayer()
+	accKey := p.GetKey(feePayer)
+
+	gasKey, err := accKey.SigValidationGas(currentBlockNumber, accountkey.RoleFeePayer, len(pubkey))
+	if err != nil {
+		return 0, err
+	}
+
+	if err := accountkey.ValidateAccountKey(currentBlockNumber, feePayer, accKey, pubkey, accountkey.RoleFeePayer); err != nil {
+		return 0, ErrInvalidAccountKey
+	}
+
+	tx.mu.Lock()
+	if tx.validatedFeePayer == tx.validatedSender {
+		tx.validatedFeePayer = feePayer
+	}
+	tx.mu.Unlock()
+
+	return gasKey, nil
+}
+
+// Transactions is a Transaction slice type for basic sorting.
+type Transactions []*Transaction
+
+// Len returns the length of s.
+func (s Transactions) Len() int { return len(s) }
+
+// Swap swaps the i'th and the j'th element in s.
+func (s Transactions) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+
+// GetRlp implements Rlpable and returns the i'th element of s in rlp.
+func (s Transactions) GetRlp(i int) []byte {
+	enc, _ := rlp.EncodeToBytes(s[i])
+	return enc
+}
+
+// TxDifference returns a new set t which is the difference between a to b.
+func TxDifference(a, b Transactions) (keep Transactions) {
+	keep = make(Transactions, 0, len(a))
+
+	remove := make(map[common.Hash]struct{})
+	for _, tx := range b {
+		remove[tx.Hash()] = struct{}{}
+	}
+
+	for _, tx := range a {
+		if _, ok := remove[tx.Hash()]; !ok {
+			keep = append(keep, tx)
+		}
+	}
+
+	return keep
+}
+
+// FilterTransactionWithBaseFee returns a list of transactions for each account that filters transactions
+// that are greater than or equal to baseFee.
+func FilterTransactionWithBaseFee(pending map[common.Address]Transactions, baseFee *big.Int) map[common.Address]Transactions {
+	txMap := make(map[common.Address]Transactions)
+	for addr, list := range pending {
+		txs := list
+		for i, tx := range list {
+			if tx.GasPrice().Cmp(baseFee) < 0 {
+				txs = list[:i]
+				break
+			}
+		}
+
+		if len(txs) > 0 {
+			txMap[addr] = txs
+		}
+	}
+	return txMap
+}
+
+// TxByNonce implements the sort interface to allow sorting a list of transactions
+// by their nonces. This is usually only useful for sorting transactions from a
+// single account, otherwise a nonce comparison doesn't make much sense.
+type TxByNonce Transactions
+
+func (s TxByNonce) Len() int { return len(s) }
+func (s TxByNonce) Less(i, j int) bool {
+	return s[i].data.GetNonce() < s[j].data.GetNonce()
+}
+func (s TxByNonce) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+
+// txWithMinerFee wraps a transaction with its gas price or effective miner gasTipCap
+type txWithMinerFee struct {
+	tx   *Transaction
+	from common.Address
+	fees *big.Int
+}
+
+// newTxWithMinerFee creates a wrapped transaction, calculating the effective
+// miner gasTipCap if a base fee is provided.
+// Returns error in case of a negative effective miner gasTipCap.
+func newTxWithMinerFee(tx *Transaction, from common.Address, baseFee *big.Int) (*txWithMinerFee, error) {
+	tip := new(big.Int).Set(tx.GasTipCap())
+	if baseFee != nil {
+		if tx.GasFeeCap().Cmp(baseFee) < 0 {
+			return nil, errors.New("invalid gas fee cap. It must be set to value greater than or equal to baseFee")
+		}
+		tip = new(big.Int).Sub(tx.GasFeeCap(), baseFee)
+		if tip.Cmp(tx.GasTipCap()) == 1 {
+			tip = tx.GasTipCap()
+		}
+	}
+	return &txWithMinerFee{
+		tx:   tx,
+		from: from,
+		fees: tip,
+	}, nil
+}
+
+// txByPriceAndTime implements both the sort and the heap interface, making it useful
+// for all at once sorting as well as individually adding and removing elements.
+type txByPriceAndTime []*txWithMinerFee
+
+func (s txByPriceAndTime) Len() int { return len(s) }
+func (s txByPriceAndTime) Less(i, j int) bool {
+	// If the prices are equal, use the time the transaction was first seen for
+	// deterministic sorting
+	cmp := s[i].fees.Cmp(s[j].fees)
+	if cmp == 0 {
+		return s[i].tx.Time().Before(s[j].tx.Time())
+	}
+	return cmp > 0
+}
+func (s txByPriceAndTime) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+
+func (s *txByPriceAndTime) Push(x interface{}) {
+	*s = append(*s, x.(*txWithMinerFee))
+}
+
+func (s *txByPriceAndTime) Pop() interface{} {
+	old := *s
+	n := len(old)
+	x := old[n-1]
+	old[n-1] = nil
+	*s = old[0 : n-1]
+	return x
+}
+
+// SortTxsByPriceAndTime is used to sort the txs by expected effectiveGasTip and then arrival time.
+// It is called on the process of txs broadcasting. There's three points when this function called.
+// (1) BroadcastTxs: before broadcasting txs to the peers
+// (2) RebroadcastTxs: before rebroadcasting the remaining pending txs to the peers
+// (3) syncTransactions: before sending the all pending txs to the newly connected peer
+func SortTxsByPriceAndTime(txs Transactions, baseFee *big.Int) Transactions {
+	sortedTxsWithMinerFee := make(txByPriceAndTime, len(txs))
+	for i, tx := range txs {
+		// fee cannot be negative
+		sortedTxsWithMinerFee[i] = &txWithMinerFee{tx, common.Address{}, math.BigMax(tx.EffectiveGasTip(baseFee), big.NewInt(0))}
+	}
+
+	// If already sorted, just return original txs.
+	if sort.IsSorted(sortedTxsWithMinerFee) {
+		return txs
+	}
+
+	// Sort the batch of txs and derive sortedTxs to return it.
+	sort.Sort(sortedTxsWithMinerFee)
+	sortedTxs := make(Transactions, len(txs))
+	for i, tx := range sortedTxsWithMinerFee {
+		sortedTxs[i] = tx.tx
+	}
+	return sortedTxs
+}
+
+// TransactionsByPriceAndNonce represents a set of transactions that can return
+// transactions in a profit-maximizing sorted order, while supporting removing
+// entire batches of transactions for non-executable accounts.
+type TransactionsByPriceAndNonce struct {
+	txs     map[common.Address]Transactions // Per account nonce-sorted list of transactions
+	heads   txByPriceAndTime                // Next transaction for each unique account (price heap)
+	signer  Signer                          // Signer for the set of transactions
+	baseFee *big.Int                        // Current base fee
+}
+
+// NewTransactionsByPriceAndNonce creates a transaction set that can retrieve
+// price sorted transactions in a nonce-honouring way.
+//
+// Note, the input map is reowned so the caller should not interact any more with
+// if after providing it to the constructor.
+func NewTransactionsByPriceAndNonce(signer Signer, txs map[common.Address]Transactions, baseFee *big.Int) *TransactionsByPriceAndNonce {
+	// Initialize a price and received time based heap with the head transactions
+	heads := make(txByPriceAndTime, 0, len(txs))
+	for from, accTxs := range txs {
+		wrapped, err := newTxWithMinerFee(accTxs[0], from, baseFee)
+		if err != nil {
+			delete(txs, from)
+			continue
+		}
+		heads = append(heads, wrapped)
+		txs[from] = accTxs[1:]
+	}
+	heap.Init(&heads)
+
+	// Assemble and return the transaction set
+	return &TransactionsByPriceAndNonce{
+		txs:     txs,
+		heads:   heads,
+		signer:  signer,
+		baseFee: baseFee,
+	}
+}
+
+// Peek returns the next transaction by price and nonce.
+func (t *TransactionsByPriceAndNonce) Peek() *Transaction {
+	if len(t.heads) == 0 {
+		return nil
+	}
+	return t.heads[0].tx
+}
+
+// Shift replaces the current best head with the next one from the same account.
+func (t *TransactionsByPriceAndNonce) Shift() {
+	if len(t.heads) == 0 {
+		return
+	}
+	acc := t.heads[0].from
+	if txs, ok := t.txs[acc]; ok && len(txs) > 0 {
+		if wrapped, err := newTxWithMinerFee(txs[0], acc, t.baseFee); err == nil {
+			t.heads[0], t.txs[acc] = wrapped, txs[1:]
+			heap.Fix(&t.heads, 0)
+			return
+		}
+	}
+	heap.Pop(&t.heads)
+}
+
+// Pop removes the best transaction, *not* replacing it with the next one from
+// the same account. This should be used when a transaction cannot be executed
+// and hence all subsequent ones should be discarded from the same account.
+func (t *TransactionsByPriceAndNonce) Pop() {
+	if len(t.heads) == 0 {
+		return
+	}
+	heap.Pop(&t.heads)
+}
+
+// Empty returns if the price heap is empty. It can be used to check it simpler
+// than calling peek and checking for nil return.
+func (t *TransactionsByPriceAndNonce) Empty() bool {
+	return len(t.heads) == 0
+}
+
+// Clear removes the entire content of the heap.
+func (t *TransactionsByPriceAndNonce) Clear() {
+	t.heads, t.txs = nil, nil
+}
+
+// Copy the current object.
+func (t *TransactionsByPriceAndNonce) Copy() *TransactionsByPriceAndNonce {
+	txsCopy := make(map[common.Address]Transactions)
+	maps.Copy(txsCopy, t.txs)
+
+	headsCopy := make(txByPriceAndTime, len(t.heads))
+	copy(headsCopy, t.heads)
+
+	return &TransactionsByPriceAndNonce{
+		txs:     txsCopy, // shift changes it.
+		heads:   t.heads, // pop, shift changes it.
+		signer:  t.signer,
+		baseFee: t.baseFee, // read-only
+	}
+}
+
+func GetRoleTypeForValidation(txType TxType) accountkey.RoleType {
+	switch txType {
+	case TxTypeAccountUpdate, TxTypeFeeDelegatedAccountUpdate, TxTypeFeeDelegatedAccountUpdateWithRatio:
+		return accountkey.RoleAccountUpdate
+	default:
+		return accountkey.RoleTransaction
+	}
+}
+
+// NewMessage returns a `*Transaction` object with the given arguments.
+// Care must be taken when creating SetCodeTx because if you assign nil to `to`,
+// a panic will occur because `newTxInternalDataEthereumSetCodeWithValues` reference the pointer of `to`.
+func NewMessage(from common.Address, to *common.Address, nonce uint64, amount *big.Int, gasLimit uint64, gasPrice, gasFeeCap, gasTipCap, blobGasFeeCap *big.Int, data []byte, checkNonce bool, intrinsicGas uint64, list AccessList, chainId *big.Int, blobHashes []common.Hash, sidecar *BlobTxSidecar, auth []SetCodeAuthorization) *Transaction {
+	transaction := &Transaction{
+		validatedGas:      &ValidatedGas{IntrinsicGas: intrinsicGas, SigValidateGas: 0},
+		validatedFeePayer: from,
+		validatedSender:   from,
+		checkNonce:        checkNonce,
+	}
+
+	// Call supports EthereumAccessList, EthereumDynamicFee, EthereumBlob, EthereumSetCode and Legacy txTypes only.
+	if auth != nil {
+		internalData := newTxInternalDataEthereumSetCodeWithValues(nonce, *to, amount, gasLimit, gasFeeCap, gasTipCap, data, list, chainId, auth)
+		transaction.setDecoded(internalData, 0)
+	} else if blobGasFeeCap != nil && blobHashes != nil {
+		internalData := newTxInternalDataEthereumBlobWithValues(nonce, *to, amount, gasLimit, gasTipCap, gasFeeCap, data, list, chainId, blobGasFeeCap, blobHashes, sidecar)
+		transaction.setDecoded(internalData, 0)
+	} else if gasFeeCap != nil && gasTipCap != nil {
+		internalData := newTxInternalDataEthereumDynamicFeeWithValues(nonce, to, amount, gasLimit, gasTipCap, gasFeeCap, data, list, chainId)
+		transaction.setDecoded(internalData, 0)
+	} else if list != nil {
+		internalData := newTxInternalDataEthereumAccessListWithValues(nonce, to, amount, gasLimit, gasPrice, data, list, chainId)
+		transaction.setDecoded(internalData, 0)
+	} else {
+		internalData := newTxInternalDataLegacyWithValues(nonce, to, amount, gasLimit, gasPrice, data)
+		transaction.setDecoded(internalData, 0)
+	}
+
+	return transaction
+}

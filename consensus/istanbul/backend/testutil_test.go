@@ -1,0 +1,380 @@
+// Modifications Copyright 2020 The klaytn Authors
+// Copyright 2017 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
+package backend
+
+import (
+	"crypto/ecdsa"
+	"errors"
+	"flag"
+	"math/big"
+	"testing"
+	"time"
+
+	"github.com/kaiachain/kaia/blockchain"
+	"github.com/kaiachain/kaia/blockchain/system"
+	"github.com/kaiachain/kaia/blockchain/types"
+	"github.com/kaiachain/kaia/blockchain/vm"
+	"github.com/kaiachain/kaia/common"
+	"github.com/kaiachain/kaia/consensus/istanbul"
+	"github.com/kaiachain/kaia/crypto"
+	"github.com/kaiachain/kaia/crypto/bls"
+	"github.com/kaiachain/kaia/datasync/downloader"
+	"github.com/kaiachain/kaia/kaiax"
+	gov_impl "github.com/kaiachain/kaia/kaiax/gov/impl"
+	randao_impl "github.com/kaiachain/kaia/kaiax/randao/impl"
+	staking_impl "github.com/kaiachain/kaia/kaiax/staking/impl"
+	system_impl "github.com/kaiachain/kaia/kaiax/system/impl"
+	valset_impl "github.com/kaiachain/kaia/kaiax/valset/impl"
+	"github.com/kaiachain/kaia/log"
+	"github.com/kaiachain/kaia/params"
+	"github.com/kaiachain/kaia/rlp"
+	"github.com/kaiachain/kaia/storage/database"
+)
+
+var (
+	testBaseConfig   *params.ChainConfig
+	testKoreConfig   *params.ChainConfig
+	testRandaoConfig *params.ChainConfig
+)
+
+func init() {
+	testBaseConfig = &params.ChainConfig{
+		ChainID:    big.NewInt(1),
+		Istanbul:   params.GetDefaultIstanbulConfig(),
+		Governance: params.GetDefaultGovernanceConfig(),
+	}
+
+	testKoreConfig = testBaseConfig.Copy()
+	testKoreConfig.IstanbulCompatibleBlock = common.Big0
+	testKoreConfig.LondonCompatibleBlock = common.Big0
+	testKoreConfig.EthTxTypeCompatibleBlock = common.Big0
+	testKoreConfig.MagmaCompatibleBlock = common.Big0
+	testKoreConfig.KoreCompatibleBlock = common.Big0
+
+	testRandaoConfig = testKoreConfig.Copy()
+	testRandaoConfig.ShanghaiCompatibleBlock = common.Big0
+	testRandaoConfig.CancunCompatibleBlock = common.Big0
+	testRandaoConfig.RandaoCompatibleBlock = common.Big0
+}
+
+type testOverrides struct {
+	node0Key       *ecdsa.PrivateKey // Override node[0] key
+	node0BlsKey    bls.SecretKey     // Override node[0] bls key
+	blockPeriod    *uint64           // Override block generation interval. If not set, 1 second is used.
+	stakingAmounts []uint64          // Override staking amounts. If not set, 0 for all nodes.
+}
+
+type testContext struct {
+	config      *params.ChainConfig
+	nodeKeys    []*ecdsa.PrivateKey // Generated node keys
+	nodeAddrs   []common.Address    // Generated node addrs
+	nodeBlsKeys []bls.SecretKey     // Generated node bls keys
+	oldInterval int64
+
+	chain  *blockchain.BlockChain
+	engine *backend
+}
+
+func newTestContext(numNodes int, config *params.ChainConfig, overrides *testOverrides) *testContext {
+	if config == nil {
+		config = testBaseConfig
+	}
+	if overrides == nil {
+		overrides = &testOverrides{}
+	}
+	if overrides.node0Key == nil {
+		overrides.node0Key, _ = crypto.GenerateKey()
+	}
+	if overrides.node0BlsKey == nil {
+		overrides.node0BlsKey, _ = bls.DeriveFromECDSA(overrides.node0Key)
+	}
+	if overrides.blockPeriod == nil {
+		one := uint64(1)
+		overrides.blockPeriod = &one
+	}
+	if overrides.stakingAmounts == nil {
+		overrides.stakingAmounts = make([]uint64, numNodes)
+	}
+	oldInterval := params.BlockGenerationInterval
+	params.BlockGenerationInterval = int64(*overrides.blockPeriod)
+
+	// Create node keys
+	var (
+		nodeKeys    = make([]*ecdsa.PrivateKey, numNodes)
+		nodeAddrs   = make([]common.Address, numNodes)
+		nodeBlsKeys = make([]bls.SecretKey, numNodes)
+
+		dbm = database.NewMemoryDBManager()
+	)
+	nodeKeys[0] = overrides.node0Key
+	nodeAddrs[0] = crypto.PubkeyToAddress(nodeKeys[0].PublicKey)
+	nodeBlsKeys[0] = overrides.node0BlsKey
+	for i := 1; i < numNodes; i++ {
+		nodeKeys[i], _ = crypto.GenerateKey()
+		nodeAddrs[i] = crypto.PubkeyToAddress(nodeKeys[i].PublicKey)
+		nodeBlsKeys[i], _ = bls.DeriveFromECDSA(nodeKeys[i])
+	}
+
+	// Create genesis block
+	if config.Governance.GovernanceMode == "single" {
+		config.Governance.GoverningNode = nodeAddrs[0]
+	}
+	genesis := blockchain.DefaultKairosGenesisBlock()
+	genesis.Config = config
+	genesis.ExtraData = makeGenesisExtra(nodeAddrs)
+	genesis.Timestamp = uint64(time.Now().Unix())
+	if config.IsRandaoForkEnabled(big.NewInt(0)) {
+		allocRegistryStorage := system.AllocRegistry(&params.RegistryConfig{
+			Records: map[string]common.Address{
+				"KIP113": system.Kip113LogicAddrMock,
+			},
+			Owner: common.HexToAddress("0xffff"),
+		})
+		infos := make(map[common.Address]system.BlsPublicKeyInfo)
+		for i, addr := range nodeAddrs {
+			infos[addr] = system.BlsPublicKeyInfo{
+				PublicKey: nodeBlsKeys[i].PublicKey().Marshal(),
+				Pop:       bls.PopProve(nodeBlsKeys[i]).Marshal(),
+			}
+		}
+		allocKip113Storage := system.AllocKip113Proxy(system.AllocKip113Init{
+			Infos: infos,
+			Owner: common.HexToAddress("0xffff"),
+		})
+		alloc := blockchain.GenesisAlloc{
+			system.RegistryAddr: {
+				Code:    system.RegistryMockCode,
+				Balance: big.NewInt(0),
+				Storage: allocRegistryStorage,
+			},
+			system.Kip113LogicAddrMock: {
+				Code:    system.Kip113MockCode,
+				Balance: big.NewInt(0),
+				Storage: allocKip113Storage,
+			},
+		}
+		genesis.Alloc = alloc
+	}
+	genesis.MustCommit(dbm)
+
+	// Create istanbul engine
+	istanbulConfig := &istanbul.Config{
+		Timeout:        10000,
+		ProposerPolicy: istanbul.ProposerPolicy(config.Istanbul.ProposerPolicy),
+		Epoch:          config.Istanbul.Epoch,
+		SubGroupSize:   config.Istanbul.SubGroupSize,
+	}
+
+	mGov := gov_impl.NewGovModule()
+	mRandao := randao_impl.NewRandaoModule()
+	engine := New(&BackendOpts{
+		IstanbulConfig: istanbulConfig,
+		PrivateKey:     nodeKeys[0],
+		NodeType:       common.CONSENSUSNODE,
+	}).(*backend)
+
+	// Create blockchain
+	cacheConfig := &blockchain.CacheConfig{
+		ArchiveMode:       false,
+		CacheSize:         512,
+		BlockInterval:     blockchain.DefaultBlockInterval,
+		TriesInMemory:     blockchain.DefaultTriesInMemory,
+		SnapshotCacheSize: 0, // Disable state snapshot
+	}
+	chainSealer := istanbul.NewSealerImpl(nodeKeys[0])
+	types.SetHeaderHashFn(chainSealer.HeaderHash)
+	chain, err := blockchain.NewBlockChain(dbm, cacheConfig, config, chainSealer, vm.Config{})
+	if err != nil {
+		panic(err)
+	}
+
+	mStaking := staking_impl.NewStakingModule()
+	mValset := valset_impl.NewValsetModule()
+	mSystem := system_impl.NewSystemModule()
+	fakeDownloader := downloader.NewFakeDownloader()
+	if err = errors.Join(
+		mGov.Init(&gov_impl.InitOpts{
+			Chain:       chain,
+			ChainKv:     dbm.GetMiscDB(),
+			ChainConfig: config,
+			NodeAddress: engine.Address(),
+		}),
+		mStaking.Init(&staking_impl.InitOpts{
+			ChainKv:     dbm.GetMiscDB(),
+			ChainConfig: config,
+			Chain:       chain,
+		}),
+		mValset.Init(&valset_impl.InitOpts{
+			ChainKv:       dbm.GetMiscDB(),
+			Chain:         chain,
+			StakingModule: mStaking,
+			GovModule:     mGov,
+		}),
+		mRandao.Init(&randao_impl.InitOpts{
+			ChainConfig:  config,
+			Chain:        chain,
+			Downloader:   fakeDownloader,
+			BlsSecretKey: nodeBlsKeys[0],
+		}),
+		mSystem.Init(&system_impl.InitOpts{
+			Chain: chain,
+		})); err != nil {
+		panic(err)
+	}
+	engine.RegisterKaiaxModules(mGov, mValset)
+	chain.RegisterKaiaxModules(
+		mGov,
+		mValset,
+		nil,
+		nil,
+		[]kaiax.HeaderModule{mRandao},
+		[]kaiax.BlockStateModule{mSystem},
+	)
+	// Start the engine
+	if err = engine.Start(chain, nil); err != nil {
+		panic(err)
+	}
+
+	return &testContext{
+		config:      config,
+		nodeKeys:    nodeKeys,
+		nodeAddrs:   nodeAddrs,
+		oldInterval: oldInterval,
+
+		chain:  chain,
+		engine: engine,
+	}
+}
+
+// Make empty header
+func (ctx *testContext) MakeHeader(parent *types.Block) *types.Header {
+	interval := uint64(params.BlockGenerationInterval)
+	header := &types.Header{
+		ParentHash: parent.Hash(),
+		Number:     parent.Number().Add(parent.Number(), common.Big1),
+		GasUsed:    0,
+		Extra:      parent.Extra(),
+		Time:       new(big.Int).Add(parent.Time(), new(big.Int).SetUint64(interval)),
+		BlockScore: params.DefaultBlockScore,
+	}
+	if parent.Header().BaseFee != nil {
+		// Assume BaseFee does not change
+		header.BaseFee = parent.Header().BaseFee
+	}
+	return header
+}
+
+// Block with no signature.
+func (ctx *testContext) MakeBlock(parent *types.Block) *types.Block {
+	chain := ctx.chain
+	header := ctx.MakeHeader(parent)
+	if err := chain.PrepareHeader(header); err != nil {
+		panic(err)
+	}
+	state, _ := chain.StateAt(parent.Root())
+	block, _ := chain.Processor().FinalizeState(header, state, nil, nil)
+	return block
+}
+
+// Block with proposer seal (no committed seals).
+func (ctx *testContext) MakeBlockWithSeal(parent *types.Block) *types.Block {
+	chain, engine := ctx.chain, ctx.engine
+	block := ctx.MakeBlock(parent)
+	result, err := engine.Seal(chain, block)
+	if err != nil {
+		panic(err)
+	}
+	return result
+}
+
+// Block with proposer seal and all committed seals.
+func (ctx *testContext) MakeBlockWithCommittedSeals(parent *types.Block) *types.Block {
+	blockWithoutSeal := ctx.MakeBlock(parent)
+
+	// add proposer seal for the block
+	block, err := ctx.engine.updateBlock(blockWithoutSeal)
+	if err != nil {
+		panic(err)
+	}
+
+	// write validators committed seals to the block
+	header := block.Header()
+	committedSeals, err := ctx.MakeCommittedSeals(header)
+	if err != nil {
+		panic(err)
+	}
+	if err = ctx.engine.sealer.WriteCommittedSeals(header, committedSeals); err != nil {
+		panic(err)
+	}
+	block = block.WithSeal(header)
+
+	return block
+}
+
+func (ctx *testContext) MakeCommittedSeals(header *types.Header) ([][]byte, error) {
+	committedSeals := make([][]byte, len(ctx.nodeKeys))
+	for i, key := range ctx.nodeKeys {
+		signer := istanbul.NewSealerImpl(key)
+		sig, err := signer.MakeCommittedSeal(header)
+		if err != nil {
+			return nil, err
+		}
+		committedSeals[i] = make([]byte, istanbul.IstanbulExtraSeal)
+		copy(committedSeals[i][:], sig)
+	}
+	return committedSeals, nil
+}
+
+func prepareCommittedSealForTest(hash common.Hash) []byte {
+	return append(append([]byte{}, hash.Bytes()...), byte(2))
+}
+
+func (ctx *testContext) Cleanup() {
+	ctx.chain.Stop()
+	ctx.engine.Stop()
+	params.BlockGenerationInterval = ctx.oldInterval
+}
+
+func makeGenesisExtra(addrs []common.Address) []byte {
+	extra := &istanbul.IstanbulExtra{
+		Validators:    addrs,
+		Seal:          []byte{},
+		CommittedSeal: [][]byte{},
+	}
+	encoded, err := rlp.EncodeToBytes(&extra)
+	if err != nil {
+		panic(err)
+	}
+
+	vanity := make([]byte, istanbul.IstanbulExtraVanity)
+	return append(vanity, encoded...)
+}
+
+func TestTestContext(t *testing.T) {
+	ctx := newTestContext(1, nil, nil)
+	defer ctx.Cleanup()
+}
+
+func TestMain(m *testing.M) {
+	// Because api/debug/flag.go sets the global logger Info level,
+	// and BlockChain test generates a lot of Info logs, override to Warn level here.
+	flag.Parse() // needed for testing.Verbose()
+	log.EnableLogForTest(log.LvlCrit, log.LvlWarn)
+
+	m.Run()
+}

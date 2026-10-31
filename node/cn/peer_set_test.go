@@ -1,0 +1,1030 @@
+// Modifications Copyright 2024 The Kaia Authors
+// Copyright 2019 The klaytn Authors
+// This file is part of the klaytn library.
+//
+// The klaytn library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The klaytn library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the klaytn library. If not, see <http://www.gnu.org/licenses/>.
+// Modified and improved for the Kaia development.
+
+package cn
+
+import (
+	"math/big"
+	"slices"
+	"testing"
+
+	"github.com/golang/mock/gomock"
+	"github.com/kaiachain/kaia/blockchain/types"
+	"github.com/kaiachain/kaia/common"
+	"github.com/kaiachain/kaia/networks/p2p"
+	"github.com/stretchr/testify/assert"
+)
+
+func setMockPeers(mockPeers []*MockPeer) {
+	for i, mp := range mockPeers {
+		mp.EXPECT().GetAddr().Return(addrs[i]).AnyTimes()
+		mp.EXPECT().GetID().Return(nodeids[i].String()).AnyTimes()
+		mp.EXPECT().Broadcast().AnyTimes()
+		// Register calls GetP2PPeer() for the exemption check; nil keeps validation.
+		mp.EXPECT().GetP2PPeer().Return(nil).AnyTimes()
+	}
+}
+
+func setMockPeersConnType(cnPeer, pnPeer, enPeer *MockPeer) {
+	cnPeer.EXPECT().ConnType().Return(common.CONSENSUSNODE).AnyTimes()
+	pnPeer.EXPECT().ConnType().Return(common.PROXYNODE).AnyTimes()
+	enPeer.EXPECT().ConnType().Return(common.ENDPOINTNODE).AnyTimes()
+}
+
+func TestPeerSet_Register(t *testing.T) {
+	peerSet := newPeerSet()
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	cnPeer := NewMockPeer(mockCtrl)
+	pnPeer := NewMockPeer(mockCtrl)
+	enPeer := NewMockPeer(mockCtrl)
+
+	setMockPeersConnType(cnPeer, pnPeer, enPeer)
+	setMockPeers([]*MockPeer{cnPeer, pnPeer, enPeer})
+
+	assert.NoError(t, peerSet.Register(cnPeer, nil))
+	assert.NoError(t, peerSet.Register(pnPeer, nil))
+	assert.NoError(t, peerSet.Register(enPeer, nil))
+	assert.Equal(t, 3, len(peerSet.peers))
+
+	assert.Equal(t, errAlreadyRegistered, peerSet.Register(cnPeer, nil))
+	assert.Equal(t, errAlreadyRegistered, peerSet.Register(pnPeer, nil))
+	assert.Equal(t, errAlreadyRegistered, peerSet.Register(enPeer, nil))
+	assert.Equal(t, 3, len(peerSet.peers))
+
+	peerSet.closed = true
+	assert.Equal(t, errClosed, peerSet.Register(cnPeer, nil))
+	assert.Equal(t, errClosed, peerSet.Register(pnPeer, nil))
+	assert.Equal(t, errClosed, peerSet.Register(enPeer, nil))
+}
+
+func TestPeerSet_Unregister(t *testing.T) {
+	peerSet := newPeerSet()
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	cnPeer := NewMockPeer(mockCtrl)
+	pnPeer := NewMockPeer(mockCtrl)
+	enPeer := NewMockPeer(mockCtrl)
+
+	setMockPeersConnType(cnPeer, pnPeer, enPeer)
+	setMockPeers([]*MockPeer{cnPeer, pnPeer, enPeer})
+
+	cnPeer.EXPECT().Close().Times(1)
+	cnPeer.EXPECT().ExistSnapExtension().Return(false).Times(1)
+	pnPeer.EXPECT().Close().Times(1)
+	pnPeer.EXPECT().ExistSnapExtension().Return(false).Times(1)
+	enPeer.EXPECT().Close().Times(1)
+	enPeer.EXPECT().ExistSnapExtension().Return(false).Times(1)
+
+	assert.Equal(t, errNotRegistered, peerSet.Unregister(nodeids[0].String()))
+	assert.Equal(t, errNotRegistered, peerSet.Unregister(nodeids[1].String()))
+	assert.Equal(t, errNotRegistered, peerSet.Unregister(nodeids[2].String()))
+
+	assert.NoError(t, peerSet.Register(cnPeer, nil))
+	assert.NoError(t, peerSet.Register(pnPeer, nil))
+	assert.NoError(t, peerSet.Register(enPeer, nil))
+	assert.Equal(t, 3, len(peerSet.peers))
+
+	assert.NoError(t, peerSet.Unregister(nodeids[0].String()))
+	assert.NoError(t, peerSet.Unregister(nodeids[1].String()))
+	assert.NoError(t, peerSet.Unregister(nodeids[2].String()))
+	assert.Equal(t, 0, len(peerSet.peers))
+}
+
+func TestPeerSet_Peers(t *testing.T) {
+	peerSet := newPeerSet()
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	cnPeer := NewMockPeer(mockCtrl)
+	pnPeer := NewMockPeer(mockCtrl)
+	enPeer := NewMockPeer(mockCtrl)
+
+	setMockPeersConnType(cnPeer, pnPeer, enPeer)
+	setMockPeers([]*MockPeer{cnPeer, pnPeer, enPeer})
+
+	assert.NoError(t, peerSet.Register(cnPeer, nil))
+	assert.NoError(t, peerSet.Register(pnPeer, nil))
+	assert.NoError(t, peerSet.Register(enPeer, nil))
+
+	peers := peerSet.Peers()
+	expectedPeers := map[string]Peer{nodeids[0].String(): cnPeer, nodeids[1].String(): pnPeer, nodeids[2].String(): enPeer}
+	assert.EqualValues(t, expectedPeers, peers)
+}
+
+func TestPeerSet_CNPeers(t *testing.T) {
+	peerSet := newPeerSet()
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	cnPeer := NewMockPeer(mockCtrl)
+	cnPeer.EXPECT().ConnType().Return(common.CONSENSUSNODE).Times(1)
+	setMockPeers([]*MockPeer{cnPeer})
+
+	assert.EqualValues(t, map[common.Address]Peer{}, peerSet.CNPeers())
+	assert.NoError(t, peerSet.Register(cnPeer, nil))
+	assert.EqualValues(t, map[common.Address]Peer{addrs[0]: cnPeer}, peerSet.CNPeers())
+}
+
+func TestPeerSet_PNPeers(t *testing.T) {
+	peerSet := newPeerSet()
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	pnPeer := NewMockPeer(mockCtrl)
+	pnPeer.EXPECT().ConnType().Return(common.PROXYNODE).Times(1)
+	setMockPeers([]*MockPeer{pnPeer})
+
+	assert.EqualValues(t, map[common.Address]Peer{}, peerSet.PNPeers())
+	assert.NoError(t, peerSet.Register(pnPeer, nil))
+	assert.EqualValues(t, map[common.Address]Peer{addrs[0]: pnPeer}, peerSet.PNPeers())
+}
+
+func TestPeerSet_ENPeers(t *testing.T) {
+	peerSet := newPeerSet()
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	enPeer := NewMockPeer(mockCtrl)
+	enPeer.EXPECT().ConnType().Return(common.ENDPOINTNODE).Times(1)
+	setMockPeers([]*MockPeer{enPeer})
+
+	assert.EqualValues(t, map[common.Address]Peer{}, peerSet.ENPeers())
+	assert.NoError(t, peerSet.Register(enPeer, nil))
+	assert.EqualValues(t, map[common.Address]Peer{addrs[0]: enPeer}, peerSet.ENPeers())
+}
+
+func TestPeerSet_Peer_And_Len(t *testing.T) {
+	peerSet := newPeerSet()
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	cnPeer := NewMockPeer(mockCtrl)
+	pnPeer := NewMockPeer(mockCtrl)
+	enPeer := NewMockPeer(mockCtrl)
+
+	setMockPeersConnType(cnPeer, pnPeer, enPeer)
+	setMockPeers([]*MockPeer{cnPeer, pnPeer, enPeer})
+
+	assert.Equal(t, 0, peerSet.Len())
+	assert.NoError(t, peerSet.Register(cnPeer, nil))
+	assert.Equal(t, 1, peerSet.Len())
+	assert.NoError(t, peerSet.Register(pnPeer, nil))
+	assert.Equal(t, 2, peerSet.Len())
+	assert.NoError(t, peerSet.Register(enPeer, nil))
+	assert.Equal(t, 3, peerSet.Len())
+
+	assert.Equal(t, cnPeer, peerSet.Peer(nodeids[0].String()))
+	assert.Equal(t, pnPeer, peerSet.Peer(nodeids[1].String()))
+	assert.Equal(t, enPeer, peerSet.Peer(nodeids[2].String()))
+}
+
+func TestPeerSet_PeersWithoutBlock(t *testing.T) {
+	peerSet := newPeerSet()
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	block := newBlock(blockNum1)
+
+	cnPeer := NewMockPeer(mockCtrl)
+	pnPeer := NewMockPeer(mockCtrl)
+	enPeer := NewMockPeer(mockCtrl)
+
+	setMockPeersConnType(cnPeer, pnPeer, enPeer)
+	setMockPeers([]*MockPeer{cnPeer, pnPeer, enPeer})
+
+	cnPeer.EXPECT().KnowsBlock(block.Hash()).Return(false).AnyTimes()
+	pnPeer.EXPECT().KnowsBlock(block.Hash()).Return(true).AnyTimes()
+	enPeer.EXPECT().KnowsBlock(block.Hash()).Return(false).AnyTimes()
+
+	assert.NoError(t, peerSet.Register(cnPeer, nil))
+	assert.NoError(t, peerSet.Register(pnPeer, nil))
+	assert.NoError(t, peerSet.Register(enPeer, nil))
+
+	peersWithoutBlock := peerSet.PeersWithoutBlock(block.Hash())
+	assert.Equal(t, 2, len(peersWithoutBlock))
+	assert.EqualValues(t, []Peer{cnPeer, enPeer}, peersWithoutBlock)
+
+	cnWithoutBlock := peerSet.CNWithoutBlock(block.Hash())
+	assert.Equal(t, 1, len(cnWithoutBlock))
+	assert.Equal(t, []Peer{cnPeer}, cnWithoutBlock)
+
+	pnWithoutBlock := peerSet.PNWithoutBlock(block.Hash())
+	assert.Equal(t, 0, len(pnWithoutBlock))
+	assert.Equal(t, []Peer{}, pnWithoutBlock)
+
+	enWithoutBlock := peerSet.ENWithoutBlock(block.Hash())
+	assert.Equal(t, 1, len(enWithoutBlock))
+	assert.Equal(t, []Peer{enPeer}, enWithoutBlock)
+}
+
+func TestPeerSet_PeersWithoutTx(t *testing.T) {
+	peerSet := newPeerSet()
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+	tx := types.NewTransaction(111, addrs[0], big.NewInt(111), 111, big.NewInt(111), nil)
+
+	cnPeer := NewMockPeer(mockCtrl)
+	pnPeer := NewMockPeer(mockCtrl)
+	enPeer := NewMockPeer(mockCtrl)
+
+	setMockPeersConnType(cnPeer, pnPeer, enPeer)
+	setMockPeers([]*MockPeer{cnPeer, pnPeer, enPeer})
+
+	cnPeer.EXPECT().KnowsTx(tx.Hash()).Return(false).AnyTimes()
+	pnPeer.EXPECT().KnowsTx(tx.Hash()).Return(true).AnyTimes()
+	enPeer.EXPECT().KnowsTx(tx.Hash()).Return(false).AnyTimes()
+
+	assert.EqualValues(t, []Peer{}, peerSet.PeersWithoutTx(tx.Hash()))
+
+	assert.NoError(t, peerSet.Register(cnPeer, nil))
+	assert.NoError(t, peerSet.Register(pnPeer, nil))
+	assert.NoError(t, peerSet.Register(enPeer, nil))
+
+	peersWithoutTx := peerSet.PeersWithoutTx(tx.Hash())
+
+	assert.Equal(t, 2, len(peersWithoutTx))
+	assert.EqualValues(t, []Peer{cnPeer, enPeer}, peersWithoutTx)
+}
+
+func TestPeerSet_TypePeersWithoutTx(t *testing.T) {
+	peerSet := newPeerSet()
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+	tx := types.NewTransaction(111, addrs[0], big.NewInt(111), 111, big.NewInt(111), nil)
+
+	cnPeer := NewMockPeer(mockCtrl)
+	pnPeer := NewMockPeer(mockCtrl)
+	enPeer := NewMockPeer(mockCtrl)
+
+	cnPeer.EXPECT().KnowsTx(tx.Hash()).Return(false).AnyTimes()
+	pnPeer.EXPECT().KnowsTx(tx.Hash()).Return(true).AnyTimes()
+	enPeer.EXPECT().KnowsTx(tx.Hash()).Return(false).AnyTimes()
+
+	setMockPeersConnType(cnPeer, pnPeer, enPeer)
+	setMockPeers([]*MockPeer{cnPeer, pnPeer, enPeer})
+
+	assert.EqualValues(t, []Peer{}, peerSet.TypePeersWithoutTx(tx.Hash(), common.CONSENSUSNODE))
+	assert.EqualValues(t, []Peer{}, peerSet.TypePeersWithoutTx(tx.Hash(), common.PROXYNODE))
+	assert.EqualValues(t, []Peer{}, peerSet.TypePeersWithoutTx(tx.Hash(), common.ENDPOINTNODE))
+
+	assert.NoError(t, peerSet.Register(cnPeer, nil))
+	assert.NoError(t, peerSet.Register(pnPeer, nil))
+	assert.NoError(t, peerSet.Register(enPeer, nil))
+
+	assert.EqualValues(t, []Peer{cnPeer}, peerSet.TypePeersWithoutTx(tx.Hash(), common.CONSENSUSNODE))
+	assert.EqualValues(t, []Peer{}, peerSet.TypePeersWithoutTx(tx.Hash(), common.PROXYNODE))
+	assert.EqualValues(t, []Peer{enPeer}, peerSet.TypePeersWithoutTx(tx.Hash(), common.ENDPOINTNODE))
+}
+
+func TestPeerSet_CNWithoutTx(t *testing.T) {
+	peerSet := newPeerSet()
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+	tx := types.NewTransaction(111, addrs[0], big.NewInt(111), 111, big.NewInt(111), nil)
+
+	cnPeer := NewMockPeer(mockCtrl)
+	cnPeer.EXPECT().ConnType().Return(common.CONSENSUSNODE).AnyTimes()
+	cnPeer.EXPECT().KnowsTx(tx.Hash()).Return(false).Times(1)
+	setMockPeers([]*MockPeer{cnPeer})
+
+	assert.EqualValues(t, []Peer{}, peerSet.CNWithoutTx(tx.Hash()))
+	assert.NoError(t, peerSet.Register(cnPeer, nil))
+	assert.EqualValues(t, []Peer{cnPeer}, peerSet.CNWithoutTx(tx.Hash()))
+}
+
+func TestPeerSet_BestPeer(t *testing.T) {
+	peerSet := newPeerSet()
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	cnPeer := NewMockPeer(mockCtrl)
+	pnPeer := NewMockPeer(mockCtrl)
+	enPeer := NewMockPeer(mockCtrl)
+
+	setMockPeersConnType(cnPeer, pnPeer, enPeer)
+	setMockPeers([]*MockPeer{cnPeer, pnPeer, enPeer})
+
+	cnPeer.EXPECT().Head().Return(common.Hash{}, big.NewInt(111)).Times(2)
+	pnPeer.EXPECT().Head().Return(common.Hash{}, big.NewInt(222)).Times(2)
+	enPeer.EXPECT().Head().Return(common.Hash{}, big.NewInt(333)).Times(1)
+	enPeer.EXPECT().ExistSnapExtension().Return(false).Times(1)
+	enPeer.EXPECT().Close().Times(1)
+
+	setMockPeersConnType(cnPeer, pnPeer, enPeer)
+	setMockPeers([]*MockPeer{cnPeer, pnPeer, enPeer})
+
+	assert.Nil(t, peerSet.BestPeer())
+
+	assert.NoError(t, peerSet.Register(cnPeer, nil))
+	assert.NoError(t, peerSet.Register(pnPeer, nil))
+	assert.NoError(t, peerSet.Register(enPeer, nil))
+
+	assert.Equal(t, enPeer, peerSet.BestPeer())
+
+	assert.NoError(t, peerSet.Unregister(nodeids[2].String()))
+
+	assert.Equal(t, pnPeer, peerSet.BestPeer())
+}
+
+func TestPeerSet_BestPeerForBlobSidecar(t *testing.T) {
+	// Test case 1: Empty peer set
+	{
+		peerSet := newPeerSet()
+		result := peerSet.BestPeerForBlobSidecar(0)
+		assert.Nil(t, result)
+	}
+
+	// Test case 2: Only peers with version < kaia67 (should be filtered out)
+	{
+		peerSet := newPeerSet()
+		mockCtrl := gomock.NewController(t)
+
+		peer1 := NewMockPeer(mockCtrl)
+		peer2 := NewMockPeer(mockCtrl)
+
+		peer1.EXPECT().ConnType().Return(common.CONSENSUSNODE).AnyTimes()
+		peer2.EXPECT().ConnType().Return(common.PROXYNODE).AnyTimes()
+		setMockPeers([]*MockPeer{peer1, peer2})
+
+		peer1.EXPECT().GetVersion().Return(kaia66).AnyTimes()
+		peer2.EXPECT().GetVersion().Return(kaia65).AnyTimes()
+
+		assert.NoError(t, peerSet.Register(peer1, nil))
+		assert.NoError(t, peerSet.Register(peer2, nil))
+
+		result := peerSet.BestPeerForBlobSidecar(0)
+		assert.Nil(t, result)
+
+		mockCtrl.Finish()
+	}
+
+	// Test case 3: Only peers with version >= kaia67, CN priority
+	{
+		peerSet := newPeerSet()
+		mockCtrl := gomock.NewController(t)
+
+		peer1 := NewMockPeer(mockCtrl)
+		peer2 := NewMockPeer(mockCtrl)
+		peer3 := NewMockPeer(mockCtrl)
+
+		setMockPeersConnType(peer1, peer2, peer3)
+		setMockPeers([]*MockPeer{peer1, peer2, peer3})
+
+		peer1.EXPECT().GetVersion().Return(kaia67).AnyTimes()
+		peer2.EXPECT().GetVersion().Return(kaia67).AnyTimes()
+		peer3.EXPECT().GetVersion().Return(kaia67).AnyTimes()
+
+		peer1.EXPECT().Head().Return(common.Hash{}, big.NewInt(100)).AnyTimes()
+		peer2.EXPECT().Head().Return(common.Hash{}, big.NewInt(200)).AnyTimes()
+		peer3.EXPECT().Head().Return(common.Hash{}, big.NewInt(300)).AnyTimes()
+
+		assert.NoError(t, peerSet.Register(peer1, nil))
+		assert.NoError(t, peerSet.Register(peer2, nil))
+		assert.NoError(t, peerSet.Register(peer3, nil))
+
+		// After sorting: peer3(300), peer2(200), peer1(100)
+		// CN: [peer1], PN: [peer2], EN: [peer3]
+		// concatPeers: [peer1, peer2, peer3]
+		// try=0: peer1 (first CN) should be selected
+		result := peerSet.BestPeerForBlobSidecar(0)
+		assert.Equal(t, peer1, result)
+
+		mockCtrl.Finish()
+	}
+
+	// Test case 4: Mixed peers (version < kaia67 and >= kaia67), CN priority
+	{
+		peerSet := newPeerSet()
+		mockCtrl := gomock.NewController(t)
+
+		peerOld1 := NewMockPeer(mockCtrl)
+		peerOld2 := NewMockPeer(mockCtrl)
+		peerNew1 := NewMockPeer(mockCtrl)
+		peerNew2 := NewMockPeer(mockCtrl)
+
+		peerOld1.EXPECT().ConnType().Return(common.CONSENSUSNODE).AnyTimes()
+		peerOld2.EXPECT().ConnType().Return(common.PROXYNODE).AnyTimes()
+		peerNew1.EXPECT().ConnType().Return(common.ENDPOINTNODE).AnyTimes()
+		peerNew2.EXPECT().ConnType().Return(common.CONSENSUSNODE).AnyTimes()
+		setMockPeers([]*MockPeer{peerOld1, peerOld2, peerNew1, peerNew2})
+
+		peerOld1.EXPECT().GetVersion().Return(kaia66).AnyTimes()
+		peerOld2.EXPECT().GetVersion().Return(kaia65).AnyTimes()
+		peerNew1.EXPECT().GetVersion().Return(kaia67).AnyTimes()
+		peerNew2.EXPECT().GetVersion().Return(kaia67).AnyTimes()
+
+		peerNew1.EXPECT().Head().Return(common.Hash{}, big.NewInt(150)).AnyTimes()
+		peerNew2.EXPECT().Head().Return(common.Hash{}, big.NewInt(250)).AnyTimes()
+
+		assert.NoError(t, peerSet.Register(peerOld1, nil))
+		assert.NoError(t, peerSet.Register(peerOld2, nil))
+		assert.NoError(t, peerSet.Register(peerNew1, nil))
+		assert.NoError(t, peerSet.Register(peerNew2, nil))
+
+		// peerNew2 is CN and should be selected
+		result := peerSet.BestPeerForBlobSidecar(0)
+		assert.Equal(t, peerNew2, result)
+
+		mockCtrl.Finish()
+	}
+
+	// Test case 5: CN priority, then PN, then try index
+	{
+		peerSet := newPeerSet()
+		mockCtrl := gomock.NewController(t)
+
+		peer1 := NewMockPeer(mockCtrl)
+		peer2 := NewMockPeer(mockCtrl)
+		peer3 := NewMockPeer(mockCtrl)
+		peer4 := NewMockPeer(mockCtrl)
+
+		peer1.EXPECT().ConnType().Return(common.CONSENSUSNODE).AnyTimes()
+		peer2.EXPECT().ConnType().Return(common.PROXYNODE).AnyTimes()
+		peer3.EXPECT().ConnType().Return(common.ENDPOINTNODE).AnyTimes()
+		peer4.EXPECT().ConnType().Return(common.CONSENSUSNODE).AnyTimes()
+		setMockPeers([]*MockPeer{peer1, peer2, peer3, peer4})
+
+		peer1.EXPECT().GetVersion().Return(kaia67).AnyTimes()
+		peer2.EXPECT().GetVersion().Return(kaia67).AnyTimes()
+		peer3.EXPECT().GetVersion().Return(kaia67).AnyTimes()
+		peer4.EXPECT().GetVersion().Return(kaia67).AnyTimes()
+
+		// Set different head block numbers
+		peer1.EXPECT().Head().Return(common.Hash{}, big.NewInt(50)).AnyTimes()
+		peer2.EXPECT().Head().Return(common.Hash{}, big.NewInt(300)).AnyTimes()
+		peer3.EXPECT().Head().Return(common.Hash{}, big.NewInt(100)).AnyTimes()
+		peer4.EXPECT().Head().Return(common.Hash{}, big.NewInt(200)).AnyTimes()
+
+		assert.NoError(t, peerSet.Register(peer1, nil))
+		assert.NoError(t, peerSet.Register(peer2, nil))
+		assert.NoError(t, peerSet.Register(peer3, nil))
+		assert.NoError(t, peerSet.Register(peer4, nil))
+
+		// After sorting: peer2(300), peer4(200), peer3(100), peer1(50)
+		// CN: [peer4, peer1] (sorted order preserved), PN: [peer2], EN: [peer3]
+		// concatPeers: [peer4, peer1, peer2, peer3]
+		// try=0: peer4 (first CN in sorted order) should be selected
+		result := peerSet.BestPeerForBlobSidecar(0)
+		assert.Equal(t, peer4, result)
+
+		// try=1: peer1 (second CN)
+		result = peerSet.BestPeerForBlobSidecar(1)
+		assert.Equal(t, peer1, result)
+
+		// try=2: peer2 (first PN)
+		result = peerSet.BestPeerForBlobSidecar(2)
+		assert.Equal(t, peer2, result)
+
+		mockCtrl.Finish()
+	}
+
+	// Test case 6: PN priority when no CN
+	{
+		peerSet := newPeerSet()
+		mockCtrl := gomock.NewController(t)
+
+		peer1 := NewMockPeer(mockCtrl)
+		peer2 := NewMockPeer(mockCtrl)
+		peer3 := NewMockPeer(mockCtrl)
+
+		peer1.EXPECT().ConnType().Return(common.PROXYNODE).AnyTimes()
+		peer2.EXPECT().ConnType().Return(common.ENDPOINTNODE).AnyTimes()
+		peer3.EXPECT().ConnType().Return(common.PROXYNODE).AnyTimes()
+		setMockPeers([]*MockPeer{peer1, peer2, peer3})
+
+		peer1.EXPECT().GetVersion().Return(kaia67).AnyTimes()
+		peer2.EXPECT().GetVersion().Return(kaia67).AnyTimes()
+		peer3.EXPECT().GetVersion().Return(kaia67).AnyTimes()
+
+		peer1.EXPECT().Head().Return(common.Hash{}, big.NewInt(100)).AnyTimes()
+		peer2.EXPECT().Head().Return(common.Hash{}, big.NewInt(200)).AnyTimes()
+		peer3.EXPECT().Head().Return(common.Hash{}, big.NewInt(300)).AnyTimes()
+
+		assert.NoError(t, peerSet.Register(peer1, nil))
+		assert.NoError(t, peerSet.Register(peer2, nil))
+		assert.NoError(t, peerSet.Register(peer3, nil))
+
+		// After sorting: peer3(300), peer2(200), peer1(100)
+		// CN: [], PN: [peer3, peer1] (sorted order preserved), EN: [peer2]
+		// concatPeers: [peer3, peer1, peer2]
+		// try=0: peer3 (first PN) should be selected
+		result := peerSet.BestPeerForBlobSidecar(0)
+		assert.Equal(t, peer3, result)
+
+		// try=1: peer1 (second PN)
+		result = peerSet.BestPeerForBlobSidecar(1)
+		assert.Equal(t, peer1, result)
+
+		mockCtrl.Finish()
+	}
+
+	// Test case 7: Try index when no CN or PN
+	{
+		peerSet := newPeerSet()
+		mockCtrl := gomock.NewController(t)
+
+		peer1 := NewMockPeer(mockCtrl)
+		peer2 := NewMockPeer(mockCtrl)
+		peer3 := NewMockPeer(mockCtrl)
+
+		peer1.EXPECT().ConnType().Return(common.ENDPOINTNODE).AnyTimes()
+		peer2.EXPECT().ConnType().Return(common.ENDPOINTNODE).AnyTimes()
+		peer3.EXPECT().ConnType().Return(common.ENDPOINTNODE).AnyTimes()
+		setMockPeers([]*MockPeer{peer1, peer2, peer3})
+
+		peer1.EXPECT().GetVersion().Return(kaia67).AnyTimes()
+		peer2.EXPECT().GetVersion().Return(kaia67).AnyTimes()
+		peer3.EXPECT().GetVersion().Return(kaia67).AnyTimes()
+
+		peer1.EXPECT().Head().Return(common.Hash{}, big.NewInt(100)).AnyTimes()
+		peer2.EXPECT().Head().Return(common.Hash{}, big.NewInt(200)).AnyTimes()
+		peer3.EXPECT().Head().Return(common.Hash{}, big.NewInt(300)).AnyTimes()
+
+		assert.NoError(t, peerSet.Register(peer1, nil))
+		assert.NoError(t, peerSet.Register(peer2, nil))
+		assert.NoError(t, peerSet.Register(peer3, nil))
+
+		// After sorting: peer3(300), peer2(200), peer1(100)
+		// CN: [], PN: [], EN: [peer3, peer2, peer1] (sorted order preserved)
+		// concatPeers: [peer3, peer2, peer1]
+		// try=0: peer3 (first EN)
+		result := peerSet.BestPeerForBlobSidecar(0)
+		assert.Equal(t, peer3, result)
+
+		// try=1: peer2 (second EN)
+		result = peerSet.BestPeerForBlobSidecar(1)
+		assert.Equal(t, peer2, result)
+
+		// try=2: peer1 (third EN)
+		result = peerSet.BestPeerForBlobSidecar(2)
+		assert.Equal(t, peer1, result)
+
+		// try=10: peer1 (10 % 3 = 1, so peer2)
+		result = peerSet.BestPeerForBlobSidecar(10)
+		assert.Equal(t, peer2, result)
+
+		mockCtrl.Finish()
+	}
+
+	// Test case 8: Peers with same head block number, CN priority
+	{
+		peerSet := newPeerSet()
+		mockCtrl := gomock.NewController(t)
+
+		peer1 := NewMockPeer(mockCtrl)
+		peer2 := NewMockPeer(mockCtrl)
+		peer3 := NewMockPeer(mockCtrl)
+
+		setMockPeersConnType(peer1, peer2, peer3)
+		setMockPeers([]*MockPeer{peer1, peer2, peer3})
+
+		peer1.EXPECT().GetVersion().Return(kaia67).AnyTimes()
+		peer2.EXPECT().GetVersion().Return(kaia67).AnyTimes()
+		peer3.EXPECT().GetVersion().Return(kaia67).AnyTimes()
+
+		// Set same head block number for peer1 and peer2
+		sameHead := big.NewInt(100)
+		peer1.EXPECT().Head().Return(common.Hash{}, sameHead).AnyTimes()
+		peer2.EXPECT().Head().Return(common.Hash{}, sameHead).AnyTimes()
+		peer3.EXPECT().Head().Return(common.Hash{}, big.NewInt(200)).AnyTimes()
+
+		assert.NoError(t, peerSet.Register(peer1, nil))
+		assert.NoError(t, peerSet.Register(peer2, nil))
+		assert.NoError(t, peerSet.Register(peer3, nil))
+
+		// After sorting: peer3(200), then peer1(100) and peer2(100) in some order
+		// CN: [peer1], PN: [peer2], EN: [peer3]
+		// concatPeers: [peer1, peer2, peer3]
+		// try=0: peer1 (first CN) should be selected
+		result := peerSet.BestPeerForBlobSidecar(0)
+		assert.Equal(t, peer1, result)
+
+		mockCtrl.Finish()
+	}
+
+	// Test case 9: concatPeers is empty (peers with version >= kaia67 but unknown connection types)
+	// This tests the defensive check for empty concatPeers by directly adding peers to peerSet.peers
+	{
+		peerSet := newPeerSet()
+		mockCtrl := gomock.NewController(t)
+
+		peer1 := NewMockPeer(mockCtrl)
+		peer2 := NewMockPeer(mockCtrl)
+
+		peer1.EXPECT().GetID().Return(nodeids[0].String()).AnyTimes()
+		peer2.EXPECT().GetID().Return(nodeids[1].String()).AnyTimes()
+
+		peer1.EXPECT().ConnType().Return(common.UNKNOWNNODE).AnyTimes()
+		peer2.EXPECT().ConnType().Return(common.BOOTNODE).AnyTimes()
+
+		peer1.EXPECT().GetVersion().Return(kaia67).AnyTimes()
+		peer2.EXPECT().GetVersion().Return(kaia67).AnyTimes()
+
+		peer1.EXPECT().Head().Return(common.Hash{}, big.NewInt(100)).AnyTimes()
+		peer2.EXPECT().Head().Return(common.Hash{}, big.NewInt(200)).AnyTimes()
+
+		// Directly add peers to peerSet.peers to bypass Register validation
+		peerSet.peers[nodeids[0].String()] = peer1
+		peerSet.peers[nodeids[1].String()] = peer2
+
+		// sortedPeers is not empty (version >= kaia67), but concatPeers is empty because
+		// no peers match CONSENSUSNODE, PROXYNODE, or ENDPOINTNODE
+		// Should return nil due to the defensive check
+		result := peerSet.BestPeerForBlobSidecar(0)
+		assert.Nil(t, result)
+
+		mockCtrl.Finish()
+	}
+}
+
+func TestPeerSet_Close(t *testing.T) {
+	peerSet := newPeerSet()
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	cnPeer := NewMockPeer(mockCtrl)
+	pnPeer := NewMockPeer(mockCtrl)
+	enPeer := NewMockPeer(mockCtrl)
+
+	cnPeer.EXPECT().DisconnectP2PPeer(p2p.DiscQuitting).Times(1)
+	pnPeer.EXPECT().DisconnectP2PPeer(p2p.DiscQuitting).Times(1)
+	enPeer.EXPECT().DisconnectP2PPeer(p2p.DiscQuitting).Times(1)
+
+	setMockPeersConnType(cnPeer, pnPeer, enPeer)
+	setMockPeers([]*MockPeer{cnPeer, pnPeer, enPeer})
+
+	assert.NoError(t, peerSet.Register(cnPeer, nil))
+	assert.NoError(t, peerSet.Register(pnPeer, nil))
+	assert.NoError(t, peerSet.Register(enPeer, nil))
+
+	assert.False(t, peerSet.closed)
+	peerSet.Close()
+	assert.True(t, peerSet.closed)
+}
+
+func TestPeerSet_SampleResendPeersByType_PN(t *testing.T) {
+	// CN Peer=1, PN Peer=0
+	{
+		peerSet := newPeerSet()
+		mockCtrl := gomock.NewController(t)
+
+		cnPeer := NewMockPeer(mockCtrl)
+		cnPeer.EXPECT().ConnType().Return(common.CONSENSUSNODE).Times(2)
+		setMockPeers([]*MockPeer{cnPeer})
+
+		assert.Equal(t, []Peer{}, peerSet.SampleResendPeersByType(common.PROXYNODE))
+		assert.NoError(t, peerSet.Register(cnPeer, nil))
+		assert.Equal(t, []Peer{cnPeer}, peerSet.SampleResendPeersByType(common.PROXYNODE))
+
+		mockCtrl.Finish()
+	}
+	// CN Peer=0, PN Peer=1
+	{
+		peerSet := newPeerSet()
+		mockCtrl := gomock.NewController(t)
+
+		pnPeer := NewMockPeer(mockCtrl)
+		pnPeer.EXPECT().ConnType().Return(common.PROXYNODE).Times(3)
+		setMockPeers([]*MockPeer{pnPeer})
+
+		assert.Equal(t, []Peer{}, peerSet.SampleResendPeersByType(common.PROXYNODE))
+		assert.NoError(t, peerSet.Register(pnPeer, nil))
+		assert.Equal(t, []Peer{pnPeer}, peerSet.SampleResendPeersByType(common.PROXYNODE))
+
+		mockCtrl.Finish()
+	}
+	// CN Peer=1, PN Peer=1
+	{
+		peerSet := newPeerSet()
+		mockCtrl := gomock.NewController(t)
+
+		cnPeer := NewMockPeer(mockCtrl)
+		pnPeer := NewMockPeer(mockCtrl)
+
+		cnPeer.EXPECT().ConnType().Return(common.CONSENSUSNODE).AnyTimes()
+		pnPeer.EXPECT().ConnType().Return(common.PROXYNODE).AnyTimes()
+
+		setMockPeers([]*MockPeer{cnPeer, pnPeer})
+
+		assert.Equal(t, []Peer{}, peerSet.SampleResendPeersByType(common.PROXYNODE))
+		assert.NoError(t, peerSet.Register(cnPeer, nil))
+		assert.NoError(t, peerSet.Register(pnPeer, nil))
+		assert.Equal(t, []Peer{cnPeer}, peerSet.SampleResendPeersByType(common.PROXYNODE))
+
+		mockCtrl.Finish()
+	}
+	// CN Peer=3, PN Peer=1
+	{
+		peerSet := newPeerSet()
+		mockCtrl := gomock.NewController(t)
+
+		cnPeer1 := NewMockPeer(mockCtrl)
+		cnPeer2 := NewMockPeer(mockCtrl)
+		cnPeer3 := NewMockPeer(mockCtrl)
+		pnPeer := NewMockPeer(mockCtrl)
+
+		cnPeer1.EXPECT().ConnType().Return(common.CONSENSUSNODE).AnyTimes()
+		cnPeer2.EXPECT().ConnType().Return(common.CONSENSUSNODE).AnyTimes()
+		cnPeer3.EXPECT().ConnType().Return(common.CONSENSUSNODE).AnyTimes()
+		pnPeer.EXPECT().ConnType().Return(common.PROXYNODE).AnyTimes()
+
+		setMockPeers([]*MockPeer{cnPeer1, cnPeer2, cnPeer3, pnPeer})
+
+		assert.Equal(t, []Peer{}, peerSet.SampleResendPeersByType(common.PROXYNODE))
+		assert.NoError(t, peerSet.Register(cnPeer1, nil))
+		assert.NoError(t, peerSet.Register(cnPeer2, nil))
+		assert.NoError(t, peerSet.Register(cnPeer3, nil))
+		assert.NoError(t, peerSet.Register(pnPeer, nil))
+		resendPeers := peerSet.SampleResendPeersByType(common.PROXYNODE)
+
+		assert.Equal(t, 2, len(resendPeers))
+		assert.False(t, containsPeer(pnPeer, resendPeers))
+
+		mockCtrl.Finish()
+	}
+}
+
+func TestPeerSet_SampleResendPeersByType_EN(t *testing.T) {
+	// PN Peer=1, EN Peer=0
+	{
+		peerSet := newPeerSet()
+		mockCtrl := gomock.NewController(t)
+
+		pnPeer := NewMockPeer(mockCtrl)
+		pnPeer.EXPECT().ConnType().Return(common.PROXYNODE).AnyTimes()
+		setMockPeers([]*MockPeer{pnPeer})
+
+		assert.Equal(t, []Peer{}, peerSet.SampleResendPeersByType(common.ENDPOINTNODE))
+		assert.NoError(t, peerSet.Register(pnPeer, nil))
+		assert.Equal(t, []Peer{pnPeer}, peerSet.SampleResendPeersByType(common.ENDPOINTNODE))
+
+		mockCtrl.Finish()
+	}
+	// PN Peer=0, EN Peer=1
+	{
+		peerSet := newPeerSet()
+		mockCtrl := gomock.NewController(t)
+
+		enPeer := NewMockPeer(mockCtrl)
+		enPeer.EXPECT().ConnType().Return(common.ENDPOINTNODE).AnyTimes()
+		setMockPeers([]*MockPeer{enPeer})
+
+		assert.Equal(t, []Peer{}, peerSet.SampleResendPeersByType(common.ENDPOINTNODE))
+		assert.NoError(t, peerSet.Register(enPeer, nil))
+		assert.Equal(t, []Peer{enPeer}, peerSet.SampleResendPeersByType(common.ENDPOINTNODE))
+
+		mockCtrl.Finish()
+	}
+	// PN Peer=1, EN Peer=1
+	{
+		peerSet := newPeerSet()
+		mockCtrl := gomock.NewController(t)
+
+		pnPeer := NewMockPeer(mockCtrl)
+		enPeer := NewMockPeer(mockCtrl)
+
+		pnPeer.EXPECT().ConnType().Return(common.PROXYNODE).AnyTimes()
+		enPeer.EXPECT().ConnType().Return(common.ENDPOINTNODE).AnyTimes()
+
+		setMockPeers([]*MockPeer{pnPeer, enPeer})
+
+		assert.Equal(t, []Peer{}, peerSet.SampleResendPeersByType(common.ENDPOINTNODE))
+		assert.NoError(t, peerSet.Register(pnPeer, nil))
+		assert.NoError(t, peerSet.Register(enPeer, nil))
+		assert.Equal(t, []Peer{pnPeer, enPeer}, peerSet.SampleResendPeersByType(common.ENDPOINTNODE))
+
+		mockCtrl.Finish()
+	}
+	// PN Peer=3, EN Peer=1
+	{
+		peerSet := newPeerSet()
+		mockCtrl := gomock.NewController(t)
+
+		pnPeer1 := NewMockPeer(mockCtrl)
+		pnPeer2 := NewMockPeer(mockCtrl)
+		pnPeer3 := NewMockPeer(mockCtrl)
+		enPeer := NewMockPeer(mockCtrl)
+
+		pnPeer1.EXPECT().ConnType().Return(common.PROXYNODE).AnyTimes()
+		pnPeer2.EXPECT().ConnType().Return(common.PROXYNODE).AnyTimes()
+		pnPeer3.EXPECT().ConnType().Return(common.PROXYNODE).AnyTimes()
+		enPeer.EXPECT().ConnType().Return(common.ENDPOINTNODE).AnyTimes()
+
+		setMockPeers([]*MockPeer{pnPeer1, pnPeer2, pnPeer3, enPeer})
+
+		assert.Equal(t, []Peer{}, peerSet.SampleResendPeersByType(common.ENDPOINTNODE))
+		registerPeers(t, peerSet, []Peer{pnPeer1, pnPeer2, pnPeer3, enPeer})
+		resendPeers := peerSet.SampleResendPeersByType(common.ENDPOINTNODE)
+
+		assert.Equal(t, 2, len(resendPeers))
+		assert.False(t, containsPeer(enPeer, resendPeers))
+
+		mockCtrl.Finish()
+	}
+	// CN Peer=1, PN Peer=2, EN Peer=2
+	{
+		peerSet := newPeerSet()
+		mockCtrl := gomock.NewController(t)
+
+		cnPeer1 := NewMockPeer(mockCtrl)
+		pnPeer1 := NewMockPeer(mockCtrl)
+		pnPeer2 := NewMockPeer(mockCtrl)
+		enPeer1 := NewMockPeer(mockCtrl)
+		enPeer2 := NewMockPeer(mockCtrl)
+
+		cnPeer1.EXPECT().ConnType().Return(common.CONSENSUSNODE).AnyTimes()
+
+		pnPeer1.EXPECT().ConnType().Return(common.PROXYNODE).AnyTimes()
+		pnPeer2.EXPECT().ConnType().Return(common.PROXYNODE).AnyTimes()
+
+		enPeer1.EXPECT().ConnType().Return(common.ENDPOINTNODE).AnyTimes()
+		enPeer2.EXPECT().ConnType().Return(common.ENDPOINTNODE).AnyTimes()
+
+		setMockPeers([]*MockPeer{cnPeer1, pnPeer1, pnPeer2, enPeer1, enPeer2})
+
+		assert.Equal(t, []Peer{}, peerSet.SampleResendPeersByType(common.ENDPOINTNODE))
+		registerPeers(t, peerSet, []Peer{cnPeer1, pnPeer1, pnPeer2, enPeer1, enPeer2})
+		resendPeers := peerSet.SampleResendPeersByType(common.ENDPOINTNODE)
+
+		assert.Equal(t, 2, len(resendPeers))
+		assert.Equal(t, 1, countPeerType(common.CONSENSUSNODE, resendPeers))
+		assert.Equal(t, 1, countPeerType(common.PROXYNODE, resendPeers))
+
+		mockCtrl.Finish()
+	}
+	// CN Peer=2, PN Peer=2, EN Peer=2
+	{
+		peerSet := newPeerSet()
+		mockCtrl := gomock.NewController(t)
+
+		cnPeer1 := NewMockPeer(mockCtrl)
+		cnPeer2 := NewMockPeer(mockCtrl)
+		pnPeer1 := NewMockPeer(mockCtrl)
+		pnPeer2 := NewMockPeer(mockCtrl)
+		enPeer1 := NewMockPeer(mockCtrl)
+		enPeer2 := NewMockPeer(mockCtrl)
+
+		cnPeer1.EXPECT().ConnType().Return(common.CONSENSUSNODE).AnyTimes()
+		cnPeer2.EXPECT().ConnType().Return(common.CONSENSUSNODE).AnyTimes()
+
+		pnPeer1.EXPECT().ConnType().Return(common.PROXYNODE).AnyTimes()
+		pnPeer2.EXPECT().ConnType().Return(common.PROXYNODE).AnyTimes()
+
+		enPeer1.EXPECT().ConnType().Return(common.ENDPOINTNODE).AnyTimes()
+		enPeer2.EXPECT().ConnType().Return(common.ENDPOINTNODE).AnyTimes()
+
+		setMockPeers([]*MockPeer{cnPeer1, cnPeer2, pnPeer1, pnPeer2, enPeer1, enPeer2})
+
+		assert.Equal(t, []Peer{}, peerSet.SampleResendPeersByType(common.ENDPOINTNODE))
+		registerPeers(t, peerSet, []Peer{cnPeer1, cnPeer2, pnPeer1, pnPeer2, enPeer1, enPeer2})
+		resendPeers := peerSet.SampleResendPeersByType(common.ENDPOINTNODE)
+
+		assert.Equal(t, 2, len(resendPeers))
+		assert.True(t, containsPeer(cnPeer1, resendPeers))
+		assert.True(t, containsPeer(cnPeer2, resendPeers))
+
+		mockCtrl.Finish()
+	}
+}
+
+func TestPeerSet_SampleResendPeersByType_Default(t *testing.T) {
+	peerSet := newPeerSet()
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	cnPeer1 := NewMockPeer(mockCtrl)
+	cnPeer2 := NewMockPeer(mockCtrl)
+	pnPeer1 := NewMockPeer(mockCtrl)
+	pnPeer2 := NewMockPeer(mockCtrl)
+	enPeer1 := NewMockPeer(mockCtrl)
+	enPeer2 := NewMockPeer(mockCtrl)
+
+	setMockPeersConnType(cnPeer1, pnPeer1, enPeer1)
+	setMockPeersConnType(cnPeer2, pnPeer2, enPeer2)
+	setMockPeers([]*MockPeer{cnPeer1, pnPeer1, enPeer1, cnPeer2, pnPeer2, enPeer2})
+	registerPeers(t, peerSet, []Peer{cnPeer1, pnPeer1, enPeer1, cnPeer2, pnPeer2, enPeer2})
+
+	assert.Nil(t, peerSet.SampleResendPeersByType(common.UNKNOWNNODE))
+	assert.Nil(t, peerSet.SampleResendPeersByType(common.BOOTNODE))
+	assert.Nil(t, peerSet.SampleResendPeersByType(common.CONSENSUSNODE))
+}
+
+func TestPeerSet_PeersWithoutBlockExceptCN(t *testing.T) {
+	peerSet := newPeerSet()
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	cnPeer1 := NewMockPeer(mockCtrl)
+	cnPeer2 := NewMockPeer(mockCtrl)
+	pnPeer1 := NewMockPeer(mockCtrl)
+	pnPeer2 := NewMockPeer(mockCtrl)
+	enPeer1 := NewMockPeer(mockCtrl)
+	enPeer2 := NewMockPeer(mockCtrl)
+
+	setMockPeersConnType(cnPeer1, pnPeer1, enPeer1)
+	setMockPeersConnType(cnPeer2, pnPeer2, enPeer2)
+	setMockPeers([]*MockPeer{cnPeer1, pnPeer1, enPeer1, cnPeer2, pnPeer2, enPeer2})
+	registerPeers(t, peerSet, []Peer{cnPeer1, pnPeer1, enPeer1, cnPeer2, pnPeer2, enPeer2})
+
+	block := newBlock(blockNum1)
+	pnPeer1.EXPECT().KnowsBlock(block.Hash()).Return(true).AnyTimes()
+	pnPeer2.EXPECT().KnowsBlock(block.Hash()).Return(false).AnyTimes()
+
+	enPeer1.EXPECT().KnowsBlock(block.Hash()).Return(false).AnyTimes()
+	enPeer2.EXPECT().KnowsBlock(block.Hash()).Return(true).AnyTimes()
+
+	result := peerSet.PeersWithoutBlockExceptCN(block.Hash())
+	assert.Equal(t, 2, len(result))
+	assert.False(t, containsPeer(cnPeer1, result))
+	assert.False(t, containsPeer(cnPeer2, result))
+	assert.False(t, containsPeer(pnPeer1, result))
+	assert.True(t, containsPeer(pnPeer2, result))
+	assert.True(t, containsPeer(enPeer1, result))
+	assert.False(t, containsPeer(enPeer2, result))
+}
+
+func TestPeerSet_TypePeersWithoutBlock(t *testing.T) {
+	peerSet := newPeerSet()
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	cnPeer1 := NewMockPeer(mockCtrl)
+	cnPeer2 := NewMockPeer(mockCtrl)
+	pnPeer1 := NewMockPeer(mockCtrl)
+	pnPeer2 := NewMockPeer(mockCtrl)
+	enPeer1 := NewMockPeer(mockCtrl)
+	enPeer2 := NewMockPeer(mockCtrl)
+
+	setMockPeersConnType(cnPeer1, pnPeer1, enPeer1)
+	setMockPeersConnType(cnPeer2, pnPeer2, enPeer2)
+	setMockPeers([]*MockPeer{cnPeer1, pnPeer1, enPeer1, cnPeer2, pnPeer2, enPeer2})
+	registerPeers(t, peerSet, []Peer{cnPeer1, pnPeer1, enPeer1, cnPeer2, pnPeer2, enPeer2})
+
+	block := newBlock(blockNum1)
+	cnPeer1.EXPECT().KnowsBlock(block.Hash()).Return(false).AnyTimes()
+	cnPeer2.EXPECT().KnowsBlock(block.Hash()).Return(true).AnyTimes()
+
+	pnPeer1.EXPECT().KnowsBlock(block.Hash()).Return(true).AnyTimes()
+	pnPeer2.EXPECT().KnowsBlock(block.Hash()).Return(false).AnyTimes()
+
+	enPeer1.EXPECT().KnowsBlock(block.Hash()).Return(false).AnyTimes()
+	enPeer2.EXPECT().KnowsBlock(block.Hash()).Return(true).AnyTimes()
+
+	result := peerSet.typePeersWithoutBlock(block.Hash(), common.CONSENSUSNODE)
+	assert.Equal(t, 1, len(result))
+	assert.True(t, containsPeer(cnPeer1, result))
+	assert.False(t, containsPeer(cnPeer2, result))
+
+	result = peerSet.typePeersWithoutBlock(block.Hash(), common.PROXYNODE)
+	assert.Equal(t, 1, len(result))
+	assert.False(t, containsPeer(pnPeer1, result))
+	assert.True(t, containsPeer(pnPeer2, result))
+
+	result = peerSet.typePeersWithoutBlock(block.Hash(), common.ENDPOINTNODE)
+	assert.Equal(t, 1, len(result))
+	assert.True(t, containsPeer(enPeer1, result))
+	assert.False(t, containsPeer(enPeer2, result))
+
+	assert.Equal(t, 0, len(peerSet.typePeersWithoutBlock(block.Hash(), common.BOOTNODE)))
+	assert.Equal(t, 0, len(peerSet.typePeersWithoutBlock(block.Hash(), common.UNKNOWNNODE)))
+}
+
+func containsPeer(target Peer, peers []Peer) bool {
+	return slices.Contains(peers, target)
+}
+
+func countPeerType(t common.ConnType, peers []Peer) int {
+	cnt := 0
+	for _, peer := range peers {
+		if t == peer.ConnType() {
+			cnt++
+		}
+	}
+	return cnt
+}
+
+func registerPeers(t *testing.T, ps *peerSet, peers []Peer) {
+	for i, p := range peers {
+		if err := ps.Register(p, nil); err != nil {
+			t.Fatalf("Failed to register peer to peerSet. index: %v, peer: %v", i, p)
+		}
+	}
+}

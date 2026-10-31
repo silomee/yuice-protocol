@@ -1,0 +1,56 @@
+// Copyright 2017 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
+package core
+
+import "errors"
+
+var (
+	// errInconsistentSubject is returned when received subject is different from
+	// current subject.
+	errInconsistentSubject = errors.New("inconsistent subjects")
+	// errInconsistentPrevHash is returned when a message of the current
+	// sequence does not extend the parent recorded for the current height.
+	errInconsistentPrevHash = errors.New("inconsistent parent hash")
+	// errNotFromProposer is returned when received message is supposed to be from
+	// proposer.
+	errNotFromProposer = errors.New("message does not come from proposer")
+	// errNotFromCommittee is returned when received message is supposed to be from a committee.
+	errNotFromCommittee = errors.New("message does not come from a committee")
+	// errInvalidCommittedSeal is returned when a COMMIT's CommittedSeal is not the
+	// sender's signature over the proposal's committed-seal preimage.
+	errInvalidCommittedSeal = errors.New("invalid committed seal")
+	// errIgnored is returned when a message was ignored.
+	errIgnored = errors.New("message is ignored")
+	// errFutureMessage is returned when current view is earlier than the
+	// view of the received message.
+	errFutureMessage = errors.New("future message")
+	// errRoundChangeTooFar is returned when a ROUND CHANGE is outside the
+	// retained future-round window.
+	errRoundChangeTooFar = errors.New("round change is too far in the future")
+	// errRoundChangeMessageLimit is returned when a ROUND CHANGE bucket already
+	// retains one message per committee member.
+	errRoundChangeMessageLimit = errors.New("round change message limit reached")
+	// errMessageTooLarge is returned when the signed part of a PREPARE, COMMIT
+	// or ROUND CHANGE exceeds maxSubjectMessageBytes, or when any message
+	// exceeds the P2P message size.
+	errMessageTooLarge = errors.New("message is too large")
+	// errOldMessage is returned when the received message's view is earlier
+	// than current view.
+	errOldMessage = errors.New("old message")
+	// errFailedDecodeMessageSet is returned when the message set is malformed.
+	errFailedDecodeMessageSet = errors.New("failed to decode message set")
+)

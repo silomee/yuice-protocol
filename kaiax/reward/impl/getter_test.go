@@ -1,0 +1,1980 @@
+// Copyright 2024 The Kaia Authors
+// This file is part of the Kaia library.
+//
+// The Kaia library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The Kaia library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the Kaia library. If not, see <http://www.gnu.org/licenses/>.
+
+package impl
+
+import (
+	"errors"
+	"math/big"
+	"testing"
+
+	"github.com/golang/mock/gomock"
+	"github.com/kaiachain/kaia/blockchain"
+	"github.com/kaiachain/kaia/blockchain/state"
+	"github.com/kaiachain/kaia/blockchain/types"
+	"github.com/kaiachain/kaia/blockchain/vm"
+	"github.com/kaiachain/kaia/common"
+	"github.com/kaiachain/kaia/consensus/faker"
+	"github.com/kaiachain/kaia/crypto"
+	"github.com/kaiachain/kaia/kaiax/gov"
+	gov_mock "github.com/kaiachain/kaia/kaiax/gov/mock"
+	"github.com/kaiachain/kaia/kaiax/reward"
+	"github.com/kaiachain/kaia/kaiax/staking"
+	staking_mock "github.com/kaiachain/kaia/kaiax/staking/mock"
+	valset_mock "github.com/kaiachain/kaia/kaiax/valset/mock"
+	"github.com/kaiachain/kaia/params"
+	"github.com/kaiachain/kaia/storage/database"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestGetRewardSummary(t *testing.T) {
+	// Test the wrapper
+	// full deferred
+	header, txs, receipts := makeTestKaiaBlock(61)
+	r := makeTestRewardModule(t, false, true, false, header, txs, receipts)
+
+	spec, err := r.GetRewardSummary(header.Number.Uint64())
+	require.Nil(t, err)
+	assert.Equal(t, &reward.RewardSummary{
+		Minted:   big.NewInt(6.4e18),
+		TotalFee: big.NewInt(0.0376e18),
+		BurntFee: big.NewInt(0.0376e18),
+	}, spec)
+
+	// Test the core logic
+	var (
+		mintingAmount  = big.NewInt(6.4e18) // 6.40 KAIA
+		rewardRatio, _ = reward.NewRewardRatio("50/20/30")
+		kip82Ratio, _  = reward.NewRewardKip82Ratio("20/80")
+		config         = &reward.RewardConfig{
+			Rewardbase:    common.HexToAddress("0xfff"),
+			MintingAmount: mintingAmount,
+			MinimumStake:  big.NewInt(5_000_000),
+			RewardRatio:   rewardRatio,
+			Kip82Ratio:    kip82Ratio,
+		}
+		lowFee  = big.NewInt(7e16) // 0.07 KAIA
+		highFee = big.NewInt(2e18) // 2.00 KAIA (F/2 > gpM)
+	)
+	testcases := []struct {
+		desc     string
+		simple   bool
+		magma    bool
+		kore     bool
+		totalFee *big.Int
+		expected *reward.RewardSummary
+	}{
+		{
+			"simple pre-magma", true, false, false, lowFee, &reward.RewardSummary{
+				Minted:   big.NewInt(6.4e18),
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(0),
+			},
+		},
+		{
+			"simple magma", true, true, false, lowFee, &reward.RewardSummary{
+				Minted:   big.NewInt(6.4e18),
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(3.5e16),
+			},
+		},
+		{
+			"simple kore", true, true, true, lowFee, &reward.RewardSummary{
+				Minted:   big.NewInt(6.4e18),
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(3.5e16), // Kore logic not used in Simple policy.
+			},
+		},
+		{
+			"full pre-magma", false, false, false, lowFee, &reward.RewardSummary{
+				Minted:   big.NewInt(6.4e18),
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(0),
+			},
+		},
+		{
+			"full magma", false, true, false, lowFee, &reward.RewardSummary{
+				Minted:   big.NewInt(6.4e18),
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(3.5e16),
+			},
+		},
+		{
+			"full kore low traffic", false, true, true, lowFee, &reward.RewardSummary{
+				Minted:   big.NewInt(6.4e18),
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(7e16),
+			},
+		},
+		{
+			"full kore high traffic", false, true, true, highFee, &reward.RewardSummary{
+				Minted:   big.NewInt(6.4e18),
+				TotalFee: big.NewInt(2e18),
+				BurntFee: big.NewInt(1.64e18),
+			},
+		},
+	}
+	for _, tc := range testcases {
+		config.IsSimple = tc.simple
+		config.Rules.IsMagma = tc.magma
+		config.Rules.IsKore = tc.kore
+		spec := getRewardSummary(config, tc.totalFee, big.NewInt(0))
+		assert.Equal(t, tc.expected, spec, tc.desc)
+	}
+}
+
+// TestGetBlockReward tests the "big branches" such as simple vs full, deferred vs non-deferred.
+// Other branches such as hardfork and ratios are covered in smaller unit tests.
+func TestGetBlockReward(t *testing.T) {
+	testcases := []struct {
+		desc           string
+		simple         bool
+		deferred       bool
+		prague         bool
+		permissionless bool
+		expected       *reward.RewardSpec
+	}{
+		{
+			// Before Permissionless, the whole non-deferred fee is credited in state transition (#1097).
+			"simple non-deferred", true, false, false, false,
+			&reward.RewardSpec{
+				RewardSummary: reward.RewardSummary{
+					Minted:   big.NewInt(6.4e18),
+					TotalFee: big.NewInt(0.0376e18),
+					BurntFee: big.NewInt(0), // nothing burnt in state transition before Permissionless
+				},
+				Proposer: big.NewInt(6.4376e18), // M + F
+				Stakers:  big.NewInt(0),
+				KIF:      big.NewInt(0),
+				KEF:      big.NewInt(0),
+				KPF:      big.NewInt(0),
+				Rewards: map[common.Address]*big.Int{
+					common.HexToAddress("0xfff"): big.NewInt(6.4376e18),
+				},
+			},
+		},
+		{
+			"simple non-deferred since permissionless", true, false, false, true,
+			&reward.RewardSpec{
+				RewardSummary: reward.RewardSummary{
+					Minted:   big.NewInt(6.4e18),
+					TotalFee: big.NewInt(0.0376e18),
+					BurntFee: big.NewInt(0.0188e18), // F/2 burnt in state transition
+				},
+				Proposer: big.NewInt(6.4188e18), // M + F/2
+				Stakers:  big.NewInt(0),
+				KIF:      big.NewInt(0),
+				KEF:      big.NewInt(0),
+				KPF:      big.NewInt(0),
+				Rewards: map[common.Address]*big.Int{
+					common.HexToAddress("0xfff"): big.NewInt(6.4188e18),
+				},
+			},
+		},
+		{
+			"simple deferred", true, true, false, false,
+			&reward.RewardSpec{
+				RewardSummary: reward.RewardSummary{
+					Minted:   big.NewInt(6.4e18),
+					TotalFee: big.NewInt(0.0376e18),
+					BurntFee: big.NewInt(0.0188e18),
+				},
+				Proposer: big.NewInt(6.4188e18),
+				Stakers:  big.NewInt(0),
+				KIF:      big.NewInt(0),
+				KEF:      big.NewInt(0),
+				KPF:      big.NewInt(0),
+				Rewards: map[common.Address]*big.Int{
+					common.HexToAddress("0xfff"): big.NewInt(6.4188e18),
+				},
+			},
+		},
+		{
+			// Before Permissionless, the whole non-deferred fee is credited in state transition (#1097).
+			"full non-deferred", false, false, false, false,
+			&reward.RewardSpec{
+				RewardSummary: reward.RewardSummary{
+					Minted:   big.NewInt(6.4e18),
+					TotalFee: big.NewInt(0.0376e18),
+					BurntFee: big.NewInt(0), // nothing burnt in state transition before Permissionless
+				},
+				Proposer: big.NewInt(0.6776e18 + 1), // gpM + remainder + F
+				Stakers:  big.NewInt(2.56e18 - 1),   // gsM - remainder
+				KIF:      big.NewInt(1.28e18),
+				KEF:      big.NewInt(1.92e18),
+				KPF:      big.NewInt(0),
+				Rewards: map[common.Address]*big.Int{
+					common.HexToAddress("0xfff"): big.NewInt(0.6776e18 + 1),
+					common.HexToAddress("0xd01"): big.NewInt(1.28e18),
+					common.HexToAddress("0xd02"): big.NewInt(1.92e18),
+					common.HexToAddress("0xc01"): big.NewInt(426666666666666666),
+					common.HexToAddress("0xc02"): big.NewInt(853333333333333333),
+					common.HexToAddress("0xc03"): big.NewInt(1280000000000000000),
+				},
+			},
+		},
+		{
+			"full non-deferred since permissionless", false, false, false, true,
+			&reward.RewardSpec{
+				RewardSummary: reward.RewardSummary{
+					Minted:   big.NewInt(6.4e18),
+					TotalFee: big.NewInt(0.0376e18),
+					BurntFee: big.NewInt(0.0188e18), // F/2 burnt in state transition
+				},
+				Proposer: big.NewInt(0.6588e18 + 1), // gpM + remainder + F/2
+				Stakers:  big.NewInt(2.56e18 - 1),   // gsM - remainder
+				KIF:      big.NewInt(1.28e18),
+				KEF:      big.NewInt(1.92e18),
+				KPF:      big.NewInt(0),
+				Rewards: map[common.Address]*big.Int{
+					common.HexToAddress("0xfff"): big.NewInt(0.6588e18 + 1),
+					common.HexToAddress("0xd01"): big.NewInt(1.28e18),
+					common.HexToAddress("0xd02"): big.NewInt(1.92e18),
+					common.HexToAddress("0xc01"): big.NewInt(426666666666666666),
+					common.HexToAddress("0xc02"): big.NewInt(853333333333333333),
+					common.HexToAddress("0xc03"): big.NewInt(1280000000000000000),
+				},
+			},
+		},
+		{
+			"full deferred", false, true, false, false,
+			&reward.RewardSpec{
+				RewardSummary: reward.RewardSummary{
+					Minted:   big.NewInt(6.4e18),
+					TotalFee: big.NewInt(0.0376e18),
+					BurntFee: big.NewInt(0.0376e18),
+				},
+				Proposer: big.NewInt(0.64e18 + 1), // gpM + remainder
+				Stakers:  big.NewInt(2.56e18 - 1), // gsM - remainder
+				KIF:      big.NewInt(1.28e18),
+				KEF:      big.NewInt(1.92e18),
+				KPF:      big.NewInt(0),
+				Rewards: map[common.Address]*big.Int{
+					common.HexToAddress("0xfff"): big.NewInt(0.64e18 + 1),
+					common.HexToAddress("0xd01"): big.NewInt(1.28e18),
+					common.HexToAddress("0xd02"): big.NewInt(1.92e18),
+					common.HexToAddress("0xc01"): big.NewInt(426666666666666666),
+					common.HexToAddress("0xc02"): big.NewInt(853333333333333333),
+					common.HexToAddress("0xc03"): big.NewInt(1280000000000000000),
+				},
+			},
+		},
+		{
+			"full deferred with CL", false, true, true, false,
+			&reward.RewardSpec{
+				RewardSummary: reward.RewardSummary{
+					Minted:   big.NewInt(6.4e18),
+					TotalFee: big.NewInt(0.0376e18),
+					BurntFee: big.NewInt(0.0376e18),
+				},
+				Proposer: big.NewInt(0.64e18 + 1), // gpM + remainder
+				Stakers:  big.NewInt(2.56e18 - 1), // gsM - remainder
+				KIF:      big.NewInt(1.28e18),
+				KEF:      big.NewInt(1.92e18),
+				KPF:      big.NewInt(0),
+				Rewards: map[common.Address]*big.Int{
+					common.HexToAddress("0xfff"): big.NewInt(0.64e18 + 1),
+					common.HexToAddress("0xd01"): big.NewInt(1.28e18),
+					common.HexToAddress("0xd02"): big.NewInt(1.92e18),
+					// Reward from AddressBook
+					common.HexToAddress("0xc01"): big.NewInt(355555626666666667),
+					common.HexToAddress("0xc02"): big.NewInt(609524053333333334),
+					common.HexToAddress("0xc03"): big.NewInt(800000480000000000),
+					// Reward from CL
+					common.HexToAddress("0xe01"): big.NewInt(71111039999999999),
+					common.HexToAddress("0xe02"): big.NewInt(243809279999999999),
+					common.HexToAddress("0xe03"): big.NewInt(479999520000000000),
+				},
+			},
+		},
+	}
+	for _, tc := range testcases {
+		header, txs, receipts := makeTestKaiaBlock(61)
+		r := makeTestRewardModuleWithConfig(t, rewardModuleTestConfig{
+			Simple:           tc.simple,
+			Deferred:         tc.deferred,
+			IsPrague:         tc.prague,
+			IsPermissionless: tc.permissionless,
+			Header:           header,
+			Txs:              txs,
+			Receipts:         receipts,
+		})
+
+		spec, err := r.GetBlockReward(header.Number.Uint64())
+		require.Nil(t, err)
+		assert.Equal(t, tc.expected, spec, tc.desc)
+	}
+}
+
+// TestSpecWithNonDeferredFee_PermissionlessBoundary verifies that the non-deferred fee reported by
+// GetBlockReward follows the state transition (see StateTransition.TransitionDb):
+// nothing is burnt between Magma and Permissionless, and F/2 is burnt since Permissionless.
+func TestSpecWithNonDeferredFee_PermissionlessBoundary(t *testing.T) {
+	var (
+		rewardbase = common.HexToAddress("0xfff")
+		execFee    = big.NewInt(7e16)
+		header     = &types.Header{Rewardbase: rewardbase}
+	)
+	testcases := []struct {
+		desc         string
+		rules        params.Rules
+		wantBurnt    *big.Int
+		wantProposer *big.Int
+	}{
+		{"magma before permissionless", params.Rules{IsMagma: true}, big.NewInt(0), execFee},
+		{"permissionless", params.Rules{IsMagma: true, IsPermissionless: true}, big.NewInt(3.5e16), big.NewInt(3.5e16)},
+	}
+	for _, tc := range testcases {
+		config := &reward.RewardConfig{Rules: tc.rules, Rewardbase: rewardbase, DeferredTxFee: false}
+		spec, err := (&RewardModule{}).specWithNonDeferredFee(reward.NewRewardSpec(), config, header, execFee)
+		require.NoError(t, err, tc.desc)
+		assert.Zero(t, execFee.Cmp(spec.TotalFee), tc.desc+" TotalFee: got %s", spec.TotalFee)
+		assert.Zero(t, tc.wantBurnt.Cmp(spec.BurntFee), tc.desc+" BurntFee: want %s got %s", tc.wantBurnt, spec.BurntFee)
+		assert.Zero(t, tc.wantProposer.Cmp(spec.Proposer), tc.desc+" Proposer: want %s got %s", tc.wantProposer, spec.Proposer)
+		assert.Zero(t, tc.wantProposer.Cmp(spec.Rewards[rewardbase]), tc.desc+" Rewards[rewardbase]: want %s got %s", tc.wantProposer, spec.Rewards[rewardbase])
+		sanityCheckRewardSpec(t, spec, tc.desc)
+	}
+
+	// Odd fee since Permissionless: the burnt half is rounded down and the proposer receives the rest,
+	// matching StateTransition.TransitionDb (fee - fee/2) for a block with a single transaction.
+	// (TransitionDb rounds per transaction while the getter rounds the block total; see #1097.)
+	oddFee := big.NewInt(7e16 + 1)
+	config := &reward.RewardConfig{Rules: params.Rules{IsMagma: true, IsPermissionless: true}, Rewardbase: rewardbase}
+	spec, err := (&RewardModule{}).specWithNonDeferredFee(reward.NewRewardSpec(), config, header, oddFee)
+	require.NoError(t, err)
+	assert.Zero(t, big.NewInt(3.5e16).Cmp(spec.BurntFee), "odd fee BurntFee: got %s", spec.BurntFee)
+	assert.Zero(t, big.NewInt(3.5e16+1).Cmp(spec.Proposer), "odd fee Proposer: got %s", spec.Proposer)
+	sanityCheckRewardSpec(t, spec, "odd fee since permissionless")
+}
+
+// Test the special case of non-deferred mode and before Magma,
+// where non-deferred fees are assigned to evm.Coinbase (= block author).
+func TestSpecWithNonDeferredFeeAuthor(t *testing.T) {
+	header, txs, receipts := makeTestPreMagmaBlock(1)
+	r := makeTestRewardModule(t, true, false, false, header, txs, receipts)
+	author, _ := r.Chain.Sealer().Author(header)
+
+	expected := &reward.RewardSpec{
+		RewardSummary: reward.RewardSummary{
+			Minted:   big.NewInt(6.4e18),
+			TotalFee: big.NewInt(0.05e18), // Simple & Pre-Magma: F (non-deferred) + F (deferred)
+			BurntFee: big.NewInt(0),
+		},
+		Proposer: big.NewInt(6.45e18), // Simple & Pre-Magma: F (non-deferred) + M + F (deferred)
+		Stakers:  big.NewInt(0),
+		KIF:      big.NewInt(0),
+		KEF:      big.NewInt(0),
+		KPF:      big.NewInt(0),
+		Rewards: map[common.Address]*big.Int{
+			author:                       big.NewInt(0.025e18), // F (non-deferred) to Coinbase (author)
+			common.HexToAddress("0xfff"): big.NewInt(6.425e18), // M + F (deferred) to Rewardbase
+		},
+	}
+
+	spec, err := r.GetBlockReward(header.Number.Uint64())
+	require.Nil(t, err)
+	assert.Equal(t, expected, spec)
+}
+
+// TestGetDeferredReward tests the "big branches" such as simple vs full, deferred vs non-deferred.
+// Other branches such as hardfork and ratios are covered in smaller unit tests.
+func TestGetDeferredReward(t *testing.T) {
+	testcases := []struct {
+		desc     string
+		simple   bool
+		deferred bool
+		prague   bool
+		expected *reward.RewardSpec
+	}{
+		{
+			"simple non-deferred", true, false, false,
+			&reward.RewardSpec{
+				RewardSummary: reward.RewardSummary{
+					Minted:   big.NewInt(6.4e18),
+					TotalFee: big.NewInt(0), // no deferred fee
+					BurntFee: big.NewInt(0),
+				},
+				Proposer: big.NewInt(6.4e18),
+				Stakers:  big.NewInt(0),
+				KIF:      big.NewInt(0),
+				KEF:      big.NewInt(0),
+				KPF:      big.NewInt(0),
+				Rewards: map[common.Address]*big.Int{
+					common.HexToAddress("0xfff"): big.NewInt(6.4e18),
+				},
+			},
+		},
+		{
+			"simple deferred", true, true, false,
+			&reward.RewardSpec{
+				RewardSummary: reward.RewardSummary{
+					Minted:   big.NewInt(6.4e18),
+					TotalFee: big.NewInt(0.0376e18),
+					BurntFee: big.NewInt(0.0188e18),
+				},
+				Proposer: big.NewInt(6.4188e18),
+				Stakers:  big.NewInt(0),
+				KIF:      big.NewInt(0),
+				KEF:      big.NewInt(0),
+				KPF:      big.NewInt(0),
+				Rewards: map[common.Address]*big.Int{
+					common.HexToAddress("0xfff"): big.NewInt(6.4188e18),
+				},
+			},
+		},
+		{
+			"full non-deferred", false, false, false,
+			&reward.RewardSpec{
+				RewardSummary: reward.RewardSummary{
+					Minted:   big.NewInt(6.4e18),
+					TotalFee: big.NewInt(0),
+					BurntFee: big.NewInt(0),
+				},
+				Proposer: big.NewInt(0.64e18 + 1), // gpM + remainder
+				Stakers:  big.NewInt(2.56e18 - 1), // gsM - remainder
+				KIF:      big.NewInt(1.28e18),
+				KEF:      big.NewInt(1.92e18),
+				KPF:      big.NewInt(0),
+				Rewards: map[common.Address]*big.Int{
+					common.HexToAddress("0xfff"): big.NewInt(0.64e18 + 1),
+					common.HexToAddress("0xd01"): big.NewInt(1.28e18),
+					common.HexToAddress("0xd02"): big.NewInt(1.92e18),
+					common.HexToAddress("0xc01"): big.NewInt(426666666666666666),
+					common.HexToAddress("0xc02"): big.NewInt(853333333333333333),
+					common.HexToAddress("0xc03"): big.NewInt(1280000000000000000),
+				},
+			},
+		},
+		{
+			"full deferred", false, true, false,
+			&reward.RewardSpec{
+				RewardSummary: reward.RewardSummary{
+					Minted:   big.NewInt(6.4e18),
+					TotalFee: big.NewInt(0.0376e18),
+					BurntFee: big.NewInt(0.0376e18),
+				},
+				Proposer: big.NewInt(0.64e18 + 1), // gpM + remainder
+				Stakers:  big.NewInt(2.56e18 - 1), // gsM - remainder
+				KIF:      big.NewInt(1.28e18),
+				KEF:      big.NewInt(1.92e18),
+				KPF:      big.NewInt(0),
+				Rewards: map[common.Address]*big.Int{
+					common.HexToAddress("0xfff"): big.NewInt(0.64e18 + 1),
+					common.HexToAddress("0xd01"): big.NewInt(1.28e18),
+					common.HexToAddress("0xd02"): big.NewInt(1.92e18),
+					common.HexToAddress("0xc01"): big.NewInt(426666666666666666),
+					common.HexToAddress("0xc02"): big.NewInt(853333333333333333),
+					common.HexToAddress("0xc03"): big.NewInt(1280000000000000000),
+				},
+			},
+		},
+		{
+			"full deferred with CL", false, true, true,
+			&reward.RewardSpec{
+				RewardSummary: reward.RewardSummary{
+					Minted:   big.NewInt(6.4e18),
+					TotalFee: big.NewInt(0.0376e18),
+					BurntFee: big.NewInt(0.0376e18),
+				},
+				Proposer: big.NewInt(0.64e18 + 1), // gpM + remainder
+				Stakers:  big.NewInt(2.56e18 - 1), // gsM - remainder
+				KIF:      big.NewInt(1.28e18),
+				KEF:      big.NewInt(1.92e18),
+				KPF:      big.NewInt(0),
+				Rewards: map[common.Address]*big.Int{
+					common.HexToAddress("0xfff"): big.NewInt(0.64e18 + 1),
+					common.HexToAddress("0xd01"): big.NewInt(1.28e18),
+					common.HexToAddress("0xd02"): big.NewInt(1.92e18),
+					// Reward from AddressBook
+					common.HexToAddress("0xc01"): big.NewInt(355555626666666667),
+					common.HexToAddress("0xc02"): big.NewInt(609524053333333334),
+					common.HexToAddress("0xc03"): big.NewInt(800000480000000000),
+					// Reward from CL
+					common.HexToAddress("0xe01"): big.NewInt(71111039999999999),
+					common.HexToAddress("0xe02"): big.NewInt(243809279999999999),
+					common.HexToAddress("0xe03"): big.NewInt(479999520000000000),
+				},
+			},
+		},
+	}
+	for _, tc := range testcases {
+		header, txs, receipts := makeTestKaiaBlock(61)
+		r := makeTestRewardModule(t, tc.simple, tc.deferred, tc.prague, header, txs, receipts)
+
+		spec, err := r.GetDeferredReward(header, txs, receipts)
+		require.Nil(t, err)
+		assert.Equal(t, tc.expected, spec, tc.desc)
+	}
+}
+
+// Since Permissionless, the staking rewards of block E go to the reward-eligible nodes of E, i.e.
+// the state of E-1 plus the transitions applied for E (the same as the committee of E), while
+// StakingInfo(E) holds every AddressBookV2 profile at E-1. Here node3 leaves and node5 is promoted at E.
+func TestGetDeferredReward_PermissionlessTransition(t *testing.T) {
+	var (
+		node3, reward3 = common.HexToAddress("0xa03"), common.HexToAddress("0xc03")
+		node5, reward5 = common.HexToAddress("0xa05"), common.HexToAddress("0xc05")
+	)
+	// Before the fork, the staking info is the legacy AddressBook, which does not have node5.
+	preForkSi := makeTestStakingInfo([]uint64{5_000_001, 5_000_002, 5_000_003, 5_000_000}, false)
+
+	// Since the fork, the staking info has every profile, node5 included.
+	si := makeTestStakingInfo([]uint64{5_000_001, 5_000_002, 5_000_003, 5_000_000}, false)
+	si.NodeIds = append(si.NodeIds, node5)
+	si.StakingContracts = append(si.StakingContracts, common.HexToAddress("0xb05"))
+	si.RewardAddrs = append(si.RewardAddrs, reward5)
+	si.StakingAmounts = append(si.StakingAmounts, 5_000_004)
+
+	// Reward-eligible nodes at E: node5 promoted to ValActive, node3 no longer ValActive.
+	var eligible []common.Address
+	for _, id := range si.NodeIds {
+		if id != node3 {
+			eligible = append(eligible, id)
+		}
+	}
+
+	for _, tc := range []struct {
+		name       string
+		num        int64
+		si         *staking.StakingInfo
+		rewarded   common.Address // receives a staking reward
+		unrewarded common.Address // receives none
+	}{
+		{"pre-fork, the staking info decides", 199, preForkSi, reward3, reward5},
+		{"post-fork, the reward-eligible nodes of the block decide", 300, si, reward5, reward3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			header, txs, receipts := makeTestKaiaBlock(tc.num)
+			r := makeTestRewardModuleWithConfig(t, rewardModuleTestConfig{
+				Deferred:            true,
+				PermissionlessBlock: testPermissionlessBlock,
+				StakingInfo:         tc.si,
+				RewardEligible:      eligible,
+				Header:              header,
+				Txs:                 txs,
+				Receipts:            receipts,
+			})
+			spec, err := r.GetDeferredReward(header, txs, receipts)
+			require.NoError(t, err)
+			sanityCheckRewardSpec(t, spec, tc.name)
+			assert.Positive(t, spec.Rewards[tc.rewarded].Sign())
+			assert.Nil(t, spec.Rewards[tc.unrewarded])
+
+			// kaia_getRewards reports the same distribution.
+			blockReward, err := r.GetBlockReward(header.Number.Uint64())
+			require.NoError(t, err)
+			assert.Equal(t, spec.Rewards, blockReward.Rewards)
+		})
+	}
+
+	t.Run("post-fork, reward-eligible nodes unavailable", func(t *testing.T) {
+		header, txs, receipts := makeTestKaiaBlock(300)
+		r := makeTestRewardModuleWithConfig(t, rewardModuleTestConfig{
+			Deferred:            true,
+			PermissionlessBlock: testPermissionlessBlock,
+			StakingInfo:         si,
+			RewardEligibleErr:   errors.New("no state"),
+			Header:              header,
+			Txs:                 txs,
+			Receipts:            receipts,
+		})
+		_, err := r.GetDeferredReward(header, txs, receipts)
+		assert.Error(t, err)
+	})
+}
+
+func TestGetExecFee(t *testing.T) {
+	largeGas := uint64(1 << 63)
+
+	testcases := []struct {
+		desc     string
+		config   *reward.RewardConfig
+		header   *types.Header
+		txs      []*types.Transaction
+		receipts []*types.Receipt
+		expected *big.Int
+	}{
+		{
+			"pre-magma",
+			&reward.RewardConfig{UnitPrice: big.NewInt(25e9)},
+			&types.Header{BaseFee: nil, GasUsed: 1_000_000},
+			[]*types.Transaction{
+				makeTestTx_type0(25e9, 200_000),
+				makeTestTx_type0(25e9, 400_000),
+				makeTestTx_type0(25e9, 600_000),
+				makeTestTx_type0(25e9, 800_000),
+			},
+			[]*types.Receipt{
+				{GasUsed: 100_000},
+				{GasUsed: 200_000},
+				{GasUsed: 300_000},
+				{GasUsed: 400_000},
+			},
+			big.NewInt(0.025e18), // unitPrice * gasUsed
+		},
+		{
+			"magma",
+			&reward.RewardConfig{Rules: params.Rules{IsMagma: true}, UnitPrice: big.NewInt(25e9)},
+			&types.Header{BaseFee: big.NewInt(27e9), GasUsed: 1_000_000},
+			[]*types.Transaction{
+				makeTestTx_type0(27e9, 200_000),
+				makeTestTx_type0(28e9, 400_000),
+				makeTestTx_type0(29e9, 600_000),
+				makeTestTx_type0(30e9, 800_000),
+			},
+			[]*types.Receipt{
+				{GasUsed: 100_000},
+				{GasUsed: 200_000},
+				{GasUsed: 300_000},
+				{GasUsed: 400_000},
+			},
+			big.NewInt(0.027e18), // baseFee * gasUsed
+		},
+		{
+			"kaia",
+			&reward.RewardConfig{Rules: params.Rules{IsMagma: true, IsKaia: true}, UnitPrice: big.NewInt(25e9)},
+			&types.Header{BaseFee: big.NewInt(27e9), GasUsed: 1_000_000},
+			[]*types.Transaction{
+				makeTestTx_type2(50e9, 1e9, 200_000), // effectivePrice = 28e9, effectiveTip = 1e9
+				makeTestTx_type2(29e9, 7e9, 400_000), // effectivePrice = 29e9, effectiveTip = 7e9
+				makeTestTx_type0(30e9, 600_000),      // effectivePrice = 30e9, effectiveTip = 3e9
+				makeTestTx_type0(50e9, 800_000),      // effectivePrice = 50e9, effectiveTip = 33e9
+			},
+			[]*types.Receipt{
+				{GasUsed: 100_000},
+				{GasUsed: 200_000},
+				{GasUsed: 300_000},
+				{GasUsed: 400_000},
+			},
+			big.NewInt(0.0376e18), // sum{ (effectiveGasTip[i] + baseFee) * gasUsed[i] }
+		},
+		{
+			"pre-magma large gas",
+			&reward.RewardConfig{UnitPrice: big.NewInt(2)},
+			&types.Header{BaseFee: nil, GasUsed: largeGas},
+			nil,
+			nil,
+			new(big.Int).Mul(new(big.Int).SetUint64(largeGas), big.NewInt(2)),
+		},
+		{
+			"magma large gas",
+			&reward.RewardConfig{Rules: params.Rules{IsMagma: true}, UnitPrice: big.NewInt(25e9)},
+			&types.Header{BaseFee: big.NewInt(2), GasUsed: largeGas},
+			nil,
+			nil,
+			new(big.Int).Mul(new(big.Int).SetUint64(largeGas), big.NewInt(2)),
+		},
+		{
+			"kaia large gas",
+			&reward.RewardConfig{Rules: params.Rules{IsMagma: true, IsKaia: true}, UnitPrice: big.NewInt(25e9)},
+			&types.Header{BaseFee: big.NewInt(2), GasUsed: largeGas},
+			[]*types.Transaction{
+				makeTestTx_type2(3, 1, 1), // effectiveTip = 1
+			},
+			[]*types.Receipt{
+				{GasUsed: largeGas},
+			},
+			new(big.Int).Mul(new(big.Int).SetUint64(largeGas), big.NewInt(3)),
+		},
+	}
+	for _, tc := range testcases {
+		totalFee, err := getExecFee(tc.config, tc.header, tc.txs, tc.receipts)
+		require.Nil(t, err)
+		assert.Equal(t, tc.expected, totalFee, tc.desc)
+	}
+}
+
+func TestGetDeferredRewardSimple(t *testing.T) {
+	var (
+		mintingAmount = big.NewInt(6.4e18) // 6.40 KAIA
+		config        = &reward.RewardConfig{
+			Rewardbase:    common.HexToAddress("0xfff"),
+			MintingAmount: mintingAmount,
+		}
+		totalFee = big.NewInt(7e16) // 0.07 KAIA
+	)
+	testcases := []struct {
+		desc     string
+		deferred bool
+		magma    bool
+		expected *reward.RewardSpec
+	}{
+		{"non-deferred pre-magma", false, false, &reward.RewardSpec{
+			RewardSummary: reward.RewardSummary{
+				Minted:   big.NewInt(6.4e18),
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(0),
+			},
+			Proposer: big.NewInt(6.47e18), // Buggy behavior; M+F despite being non-deferred.
+			Stakers:  big.NewInt(0),
+			KIF:      big.NewInt(0),
+			KEF:      big.NewInt(0),
+			KPF:      big.NewInt(0),
+			Rewards: map[common.Address]*big.Int{
+				common.HexToAddress("0xfff"): big.NewInt(6.47e18),
+			},
+		}},
+		{"non-deferred magma", false, true, &reward.RewardSpec{
+			RewardSummary: reward.RewardSummary{
+				Minted:   big.NewInt(6.4e18),
+				TotalFee: big.NewInt(0),
+				BurntFee: big.NewInt(0),
+			},
+			Proposer: big.NewInt(6.4e18),
+			Stakers:  big.NewInt(0),
+			KIF:      big.NewInt(0),
+			KEF:      big.NewInt(0),
+			KPF:      big.NewInt(0),
+			Rewards: map[common.Address]*big.Int{
+				common.HexToAddress("0xfff"): big.NewInt(6.4e18),
+			},
+		}},
+		{"deferred pre-magma", true, false, &reward.RewardSpec{
+			RewardSummary: reward.RewardSummary{
+				Minted:   big.NewInt(6.4e18),
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(0),
+			},
+			Proposer: big.NewInt(6.47e18),
+			Stakers:  big.NewInt(0),
+			KIF:      big.NewInt(0),
+			KEF:      big.NewInt(0),
+			KPF:      big.NewInt(0),
+			Rewards: map[common.Address]*big.Int{
+				common.HexToAddress("0xfff"): big.NewInt(6.47e18),
+			},
+		}},
+		{"deferred magma", true, true, &reward.RewardSpec{
+			RewardSummary: reward.RewardSummary{
+				Minted:   big.NewInt(6.4e18),
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(3.5e16),
+			},
+			Proposer: big.NewInt(6.435e18),
+			Stakers:  big.NewInt(0),
+			KIF:      big.NewInt(0),
+			KEF:      big.NewInt(0),
+			KPF:      big.NewInt(0),
+			Rewards: map[common.Address]*big.Int{
+				common.HexToAddress("0xfff"): big.NewInt(6.435e18),
+			},
+		}},
+	}
+	for _, tc := range testcases {
+		config.DeferredTxFee = tc.deferred
+		config.Rules.IsMagma = tc.magma
+
+		spec, err := getDeferredRewardSimple(config, totalFee, big.NewInt(0))
+		require.Nil(t, err, tc.desc)
+		assert.Equal(t, tc.expected, spec, tc.desc)
+		sanityCheckRewardSpec(t, spec, tc.desc)
+	}
+}
+
+func TestGetDeferredRewardFull(t *testing.T) {
+	var (
+		mintingAmount  = big.NewInt(6.4e18) // 6.40 KAIA
+		rewardRatio, _ = reward.NewRewardRatio("50/20/30")
+		kip82Ratio, _  = reward.NewRewardKip82Ratio("20/80")
+		config         = &reward.RewardConfig{
+			Rewardbase:    common.HexToAddress("0xfff"),
+			MintingAmount: mintingAmount,
+			MinimumStake:  big.NewInt(5_000_000),
+			RewardRatio:   rewardRatio,
+			Kip82Ratio:    kip82Ratio,
+		}
+		lowFee  = big.NewInt(7e16) // 0.07 KAIA
+		highFee = big.NewInt(2e18) // 2.00 KAIA (F/2 > gpM)
+	)
+	testcases := []struct {
+		desc     string
+		deferred bool
+		magma    bool
+		kore     bool
+		prague   bool
+		totalFee *big.Int
+		expected *reward.RewardSpec
+	}{
+		{"non-deferred", false, false, false, false, lowFee, &reward.RewardSpec{
+			RewardSummary: reward.RewardSummary{
+				Minted:   big.NewInt(6.4e18),
+				TotalFee: big.NewInt(0),
+				BurntFee: big.NewInt(0),
+			},
+			Proposer: big.NewInt(3.2e18),
+			Stakers:  big.NewInt(0),
+			KIF:      big.NewInt(1.28e18),
+			KEF:      big.NewInt(1.92e18),
+			KPF:      big.NewInt(0),
+			Rewards: map[common.Address]*big.Int{
+				common.HexToAddress("0xfff"): big.NewInt(3.2e18),
+				common.HexToAddress("0xd01"): big.NewInt(1.28e18),
+				common.HexToAddress("0xd02"): big.NewInt(1.92e18),
+			},
+		}},
+		{"pre-magma", true, false, false, false, lowFee, &reward.RewardSpec{
+			RewardSummary: reward.RewardSummary{
+				Minted:   big.NewInt(6.4e18),
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(0),
+			},
+			Proposer: big.NewInt(3.235e18),
+			Stakers:  big.NewInt(0),
+			KIF:      big.NewInt(1.294e18),
+			KEF:      big.NewInt(1.941e18),
+			KPF:      big.NewInt(0),
+			Rewards: map[common.Address]*big.Int{
+				common.HexToAddress("0xfff"): big.NewInt(3.235e18),
+				common.HexToAddress("0xd01"): big.NewInt(1.294e18),
+				common.HexToAddress("0xd02"): big.NewInt(1.941e18),
+			},
+		}},
+		{"magma", true, true, false, false, lowFee, &reward.RewardSpec{
+			RewardSummary: reward.RewardSummary{
+				Minted:   big.NewInt(6.4e18),
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(3.5e16),
+			},
+			Proposer: big.NewInt(3.2175e18),
+			Stakers:  big.NewInt(0),
+			KIF:      big.NewInt(1.287e18),
+			KEF:      big.NewInt(1.9305e18),
+			KPF:      big.NewInt(0),
+			Rewards: map[common.Address]*big.Int{
+				common.HexToAddress("0xfff"): big.NewInt(3.2175e18),
+				common.HexToAddress("0xd01"): big.NewInt(1.287e18),
+				common.HexToAddress("0xd02"): big.NewInt(1.9305e18),
+			},
+		}},
+		{"kore low traffic", true, true, true, false, lowFee, &reward.RewardSpec{
+			RewardSummary: reward.RewardSummary{
+				Minted:   big.NewInt(6.4e18),
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(7e16), // F
+			},
+			Proposer: big.NewInt(0.64e18 + 1), // gpM + remainder
+			Stakers:  big.NewInt(2.56e18 - 1), // gsM - remainder
+			KIF:      big.NewInt(1.28e18),
+			KEF:      big.NewInt(1.92e18),
+			KPF:      big.NewInt(0),
+			Rewards: map[common.Address]*big.Int{
+				common.HexToAddress("0xfff"): big.NewInt(0.64e18 + 1),
+				common.HexToAddress("0xd01"): big.NewInt(1.28e18),
+				common.HexToAddress("0xd02"): big.NewInt(1.92e18),
+				common.HexToAddress("0xc01"): big.NewInt(426666666666666666),
+				common.HexToAddress("0xc02"): big.NewInt(853333333333333333),
+				common.HexToAddress("0xc03"): big.NewInt(1280000000000000000),
+			},
+		}},
+		{"kore high traffic", true, true, true, false, highFee, &reward.RewardSpec{
+			RewardSummary: reward.RewardSummary{
+				Minted:   big.NewInt(6.4e18),
+				TotalFee: big.NewInt(2.00e18),
+				BurntFee: big.NewInt(1.64e18), // F/2 + gpM
+			},
+			Proposer: big.NewInt(1.00e18 + 1), // 0.64 (gpM) + 0.36 (F/2 - gpM) + remainder
+			Stakers:  big.NewInt(2.56e18 - 1), // gsM - remainder
+			KIF:      big.NewInt(1.28e18),
+			KEF:      big.NewInt(1.92e18),
+			KPF:      big.NewInt(0),
+			Rewards: map[common.Address]*big.Int{
+				common.HexToAddress("0xfff"): big.NewInt(1.00e18 + 1),
+				common.HexToAddress("0xd01"): big.NewInt(1.28e18),
+				common.HexToAddress("0xd02"): big.NewInt(1.92e18),
+				common.HexToAddress("0xc01"): big.NewInt(426666666666666666),
+				common.HexToAddress("0xc02"): big.NewInt(853333333333333333),
+				common.HexToAddress("0xc03"): big.NewInt(1280000000000000000),
+			},
+		}},
+		{"prague low traffic", true, true, true, true, lowFee, &reward.RewardSpec{
+			RewardSummary: reward.RewardSummary{
+				Minted:   big.NewInt(6.4e18),
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(7e16), // F
+			},
+			Proposer: big.NewInt(0.64e18 + 1), // gpM + remainder
+			Stakers:  big.NewInt(2.56e18 - 1), // gsM - remainder
+			KIF:      big.NewInt(1.28e18),
+			KEF:      big.NewInt(1.92e18),
+			KPF:      big.NewInt(0),
+			Rewards: map[common.Address]*big.Int{
+				common.HexToAddress("0xfff"): big.NewInt(0.64e18 + 1),
+				common.HexToAddress("0xd01"): big.NewInt(1.28e18),
+				common.HexToAddress("0xd02"): big.NewInt(1.92e18),
+				// Reward from AddressBook
+				common.HexToAddress("0xc01"): big.NewInt(355555626666666667),
+				common.HexToAddress("0xc02"): big.NewInt(609524053333333334),
+				common.HexToAddress("0xc03"): big.NewInt(800000480000000000),
+				// Reward from CL
+				common.HexToAddress("0xe01"): big.NewInt(71111039999999999),
+				common.HexToAddress("0xe02"): big.NewInt(243809279999999999),
+				common.HexToAddress("0xe03"): big.NewInt(479999520000000000),
+			},
+		}},
+		{"prague high traffic", true, true, true, true, highFee, &reward.RewardSpec{
+			RewardSummary: reward.RewardSummary{
+				Minted:   big.NewInt(6.4e18),
+				TotalFee: big.NewInt(2.00e18),
+				BurntFee: big.NewInt(1.64e18), // F/2 + gpM
+			},
+			Proposer: big.NewInt(1.00e18 + 1), // 0.64 (gpM) + 0.36 (F/2 - gpM) + remainder
+			Stakers:  big.NewInt(2.56e18 - 1), // gsM - remainder
+			KIF:      big.NewInt(1.28e18),
+			KEF:      big.NewInt(1.92e18),
+			KPF:      big.NewInt(0),
+			Rewards: map[common.Address]*big.Int{
+				common.HexToAddress("0xfff"): big.NewInt(1.00e18 + 1),
+				common.HexToAddress("0xd01"): big.NewInt(1.28e18),
+				common.HexToAddress("0xd02"): big.NewInt(1.92e18),
+				// Reward from AddressBook
+				common.HexToAddress("0xc01"): big.NewInt(355555626666666667),
+				common.HexToAddress("0xc02"): big.NewInt(609524053333333334),
+				common.HexToAddress("0xc03"): big.NewInt(800000480000000000),
+				// Reward from CL
+				common.HexToAddress("0xe01"): big.NewInt(71111039999999999),
+				common.HexToAddress("0xe02"): big.NewInt(243809279999999999),
+				common.HexToAddress("0xe03"): big.NewInt(479999520000000000),
+			},
+		}},
+	}
+	for _, tc := range testcases {
+		config.DeferredTxFee = tc.deferred
+		config.Rules.IsMagma = tc.magma
+		config.Rules.IsKore = tc.kore
+		config.Rules.IsPrague = tc.prague
+		si := makeTestStakingInfo([]uint64{5_000_001, 5_000_002, 5_000_003, 5_000_000}, tc.prague) // 1:2:3:0
+
+		spec, err := getDeferredRewardFull(config, tc.totalFee, big.NewInt(0), si)
+		require.Nil(t, err, tc.desc)
+		assert.Equal(t, tc.expected, spec, tc.desc)
+		sanityCheckRewardSpec(t, spec, tc.desc)
+	}
+}
+
+// Test that GetDeferredRewardFullFlex is equivalent to GetDeferredRewardFullKore
+// when StakingRewardThreshold = MinimumStake.
+func TestGetDeferredRewardFullFlex_CompatibleWithKore(t *testing.T) {
+	var (
+		mintingAmount  = big.NewInt(6.4e18)                // 6.40 KAIA
+		rewardRatio, _ = reward.NewRewardRatio("50/20/30") // 3-part ratio. Must behave like 50/20/30/0.
+		kip82Ratio, _  = reward.NewRewardKip82Ratio("20/80")
+		config         = &reward.RewardConfig{
+			DeferredTxFee:          true,
+			Rewardbase:             common.HexToAddress("0xfff"),
+			MintingAmount:          mintingAmount,
+			MinimumStake:           big.NewInt(5_000_000),
+			RewardRatio:            rewardRatio,
+			Kip82Ratio:             kip82Ratio,
+			StakingRewardThreshold: big.NewInt(5_000_000),
+			UseFlexReward:          true,
+		}
+		lowFee  = big.NewInt(7e16) // 0.07 KAIA
+		highFee = big.NewInt(2e18) // 2.00 KAIA (F/2 > gpM)
+	)
+	testcases := []struct {
+		desc     string
+		totalFee *big.Int
+		expected *reward.RewardSpec
+	}{
+		{"flex, low traffic, equivalent to prague", lowFee, &reward.RewardSpec{
+			RewardSummary: reward.RewardSummary{
+				Minted:   big.NewInt(6.4e18),
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(7e16), // F
+			},
+			Proposer: big.NewInt(0.64e18 + 1), // gpM + remainder
+			Stakers:  big.NewInt(2.56e18 - 1), // gsM - remainder
+			KIF:      big.NewInt(1.28e18),
+			KEF:      big.NewInt(1.92e18),
+			KPF:      big.NewInt(0),
+			Rewards: map[common.Address]*big.Int{
+				common.HexToAddress("0xfff"): big.NewInt(0.64e18 + 1),
+				common.HexToAddress("0xd01"): big.NewInt(1.28e18),
+				common.HexToAddress("0xd02"): big.NewInt(1.92e18),
+				// Reward from AddressBook
+				common.HexToAddress("0xc01"): big.NewInt(355555626666666667),
+				common.HexToAddress("0xc02"): big.NewInt(609524053333333334),
+				common.HexToAddress("0xc03"): big.NewInt(800000480000000000),
+				// Reward from CL
+				common.HexToAddress("0xe01"): big.NewInt(71111039999999999),
+				common.HexToAddress("0xe02"): big.NewInt(243809279999999999),
+				common.HexToAddress("0xe03"): big.NewInt(479999520000000000),
+			},
+		}},
+		{"flex, high traffic, equivalent to prague", highFee, &reward.RewardSpec{
+			RewardSummary: reward.RewardSummary{
+				Minted:   big.NewInt(6.4e18),
+				TotalFee: big.NewInt(2.00e18),
+				BurntFee: big.NewInt(1.64e18), // F/2 + gpM
+			},
+			Proposer: big.NewInt(1.00e18 + 1), // 0.64 (gpM) + 0.36 (F/2 - gpM) + remainder
+			Stakers:  big.NewInt(2.56e18 - 1), // gsM - remainder
+			KIF:      big.NewInt(1.28e18),
+			KEF:      big.NewInt(1.92e18),
+			KPF:      big.NewInt(0),
+			Rewards: map[common.Address]*big.Int{
+				common.HexToAddress("0xfff"): big.NewInt(1.00e18 + 1),
+				common.HexToAddress("0xd01"): big.NewInt(1.28e18),
+				common.HexToAddress("0xd02"): big.NewInt(1.92e18),
+				// Reward from AddressBook
+				common.HexToAddress("0xc01"): big.NewInt(355555626666666667),
+				common.HexToAddress("0xc02"): big.NewInt(609524053333333334),
+				common.HexToAddress("0xc03"): big.NewInt(800000480000000000),
+				// Reward from CL
+				common.HexToAddress("0xe01"): big.NewInt(71111039999999999),
+				common.HexToAddress("0xe02"): big.NewInt(243809279999999999),
+				common.HexToAddress("0xe03"): big.NewInt(479999520000000000),
+			},
+		}},
+	}
+	for _, tc := range testcases {
+		config.Rules.IsMagma = true
+		config.Rules.IsKore = true
+		config.Rules.IsPrague = true
+		config.Rules.IsOsaka = true
+		si := makeTestStakingInfo([]uint64{5_000_001, 5_000_002, 5_000_003, 5_000_000}, true) // 1:2:3:0
+
+		spec, err := getDeferredRewardFull(config, tc.totalFee, big.NewInt(0), si)
+		require.Nil(t, err, tc.desc)
+		assert.Equal(t, tc.expected, spec, tc.desc)
+		sanityCheckRewardSpec(t, spec, tc.desc)
+	}
+}
+
+func TestGetDeferredRewardFullFlex_CustomConfig(t *testing.T) {
+	var (
+		mintingAmount, _ = new(big.Int).SetString("9600000000000000000", 10) // 9.60 KAIA
+		rewardRatio, _   = reward.NewRewardRatio("40/25/25/10")              // 4-part ratio.
+		kip82Ratio, _    = reward.NewRewardKip82Ratio("0/100")
+		config           = &reward.RewardConfig{
+			DeferredTxFee: true,
+			Rewardbase:    common.HexToAddress("0xfff"),
+			MintingAmount: mintingAmount,
+			MinimumStake:  big.NewInt(5_000_000),
+			RewardRatio:   rewardRatio,
+			Kip82Ratio:    kip82Ratio,
+			UseFlexReward: true,
+		}
+		totalFee = big.NewInt(7e16) // 0.07 KAIA
+		kpfAddr  = common.HexToAddress("0xd03")
+	)
+	testcases := []struct {
+		desc      string
+		hasCL     bool
+		threshold *big.Int
+		kpfAddr   common.Address
+		expected  *reward.RewardSpec
+	}{
+		{"flex, 5m threshold, no CL", false, big.NewInt(5_000_000), kpfAddr, &reward.RewardSpec{
+			RewardSummary: reward.RewardSummary{
+				Minted:   mintingAmount,
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(3.5e16), // F/2
+			},
+			Proposer: big.NewInt(3.5e16),  // fee/2 + remainder
+			Stakers:  big.NewInt(3.84e18), // gM - remainder
+			KIF:      big.NewInt(2.40e18),
+			KEF:      big.NewInt(2.40e18),
+			KPF:      big.NewInt(0.96e18),
+			Rewards: map[common.Address]*big.Int{
+				// Proposer and funds
+				common.HexToAddress("0xfff"): big.NewInt(3.5e16),
+				common.HexToAddress("0xd01"): big.NewInt(2.40e18),
+				common.HexToAddress("0xd02"): big.NewInt(2.40e18),
+				common.HexToAddress("0xd03"): big.NewInt(0.96e18),
+				// Reward from AddressBook
+				common.HexToAddress("0xc01"): big.NewInt(1.28e18),
+				common.HexToAddress("0xc02"): big.NewInt(2.56e18),
+			},
+		}},
+		{"flex, 3m threshold, no CL", false, big.NewInt(3_000_000), kpfAddr, &reward.RewardSpec{
+			RewardSummary: reward.RewardSummary{
+				Minted:   mintingAmount,
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(3.5e16), // F/2
+			},
+			Proposer: big.NewInt(3.5e16 + 1),  // fee/2 + remainder
+			Stakers:  big.NewInt(3.84e18 - 1), // gM - remainder
+			KIF:      big.NewInt(2.40e18),
+			KEF:      big.NewInt(2.40e18),
+			KPF:      big.NewInt(0.96e18),
+			Rewards: map[common.Address]*big.Int{
+				// Proposer and funds
+				common.HexToAddress("0xfff"): big.NewInt(3.5e16 + 1),
+				common.HexToAddress("0xd01"): big.NewInt(2.40e18),
+				common.HexToAddress("0xd02"): big.NewInt(2.40e18),
+				common.HexToAddress("0xd03"): big.NewInt(0.96e18),
+				// Reward from AddressBook
+				common.HexToAddress("0xc01"): big.NewInt(1280000000000000000),
+				common.HexToAddress("0xc02"): big.NewInt(1280000639999680000),
+				common.HexToAddress("0xc04"): big.NewInt(1279999360000319999),
+			},
+		}},
+		{"flex, 0 threshold, no CL", false, big.NewInt(0), kpfAddr, &reward.RewardSpec{
+			RewardSummary: reward.RewardSummary{
+				Minted:   mintingAmount,
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(3.5e16), // F/2
+			},
+			Proposer: big.NewInt(3.5e16 + 1),  // fee/2 + remainder
+			Stakers:  big.NewInt(3.84e18 - 1), // gM - remainder
+			KIF:      big.NewInt(2.40e18),
+			KEF:      big.NewInt(2.40e18),
+			KPF:      big.NewInt(0.96e18),
+			Rewards: map[common.Address]*big.Int{
+				// Proposer and funds
+				common.HexToAddress("0xfff"): big.NewInt(3.5e16 + 1),
+				common.HexToAddress("0xd01"): big.NewInt(2.40e18),
+				common.HexToAddress("0xd02"): big.NewInt(2.40e18),
+				common.HexToAddress("0xd03"): big.NewInt(0.96e18),
+				// Reward from AddressBook
+				common.HexToAddress("0xc01"): big.NewInt(1280000000000000000),
+				common.HexToAddress("0xc02"): big.NewInt(1280000255999948800),
+				common.HexToAddress("0xc04"): big.NewInt(1279999744000051199),
+			},
+		}},
+		{"flex, 5m threshold, with CL", true, big.NewInt(5_000_000), kpfAddr, &reward.RewardSpec{
+			RewardSummary: reward.RewardSummary{
+				Minted:   mintingAmount,
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(3.5e16), // F/2
+			},
+			Proposer: big.NewInt(3.5e16),  // fee/2 + remainder
+			Stakers:  big.NewInt(3.84e18), // gM - remainder
+			KIF:      big.NewInt(2.40e18),
+			KEF:      big.NewInt(2.40e18),
+			KPF:      big.NewInt(0.96e18),
+			Rewards: map[common.Address]*big.Int{
+				// Proposer and funds
+				common.HexToAddress("0xfff"): big.NewInt(3.5e16),
+				common.HexToAddress("0xd01"): big.NewInt(2.40e18),
+				common.HexToAddress("0xd02"): big.NewInt(2.40e18),
+				common.HexToAddress("0xd03"): big.NewInt(0.96e18),
+				// Reward from AddressBook
+				common.HexToAddress("0xc01"): big.NewInt(1066666880000000000),
+				common.HexToAddress("0xc02"): big.NewInt(1828572160000000000),
+				// Reward from CL
+				common.HexToAddress("0xe01"): big.NewInt(213333120000000000),
+				common.HexToAddress("0xe02"): big.NewInt(731427840000000000),
+			},
+		}},
+		{"flex, 3m threshold, with CL", true, big.NewInt(3_000_000), kpfAddr, &reward.RewardSpec{
+			RewardSummary: reward.RewardSummary{
+				Minted:   mintingAmount,
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(3.5e16), // F/2
+			},
+			Proposer: big.NewInt(3.5e16 + 1),  // fee/2 + remainder
+			Stakers:  big.NewInt(3.84e18 - 1), // gM - remainder
+			KIF:      big.NewInt(2.40e18),
+			KEF:      big.NewInt(2.40e18),
+			KPF:      big.NewInt(0.96e18),
+			Rewards: map[common.Address]*big.Int{
+				// Proposer and funds
+				common.HexToAddress("0xfff"): big.NewInt(3.5e16 + 1),
+				common.HexToAddress("0xd01"): big.NewInt(2.40e18),
+				common.HexToAddress("0xd02"): big.NewInt(2.40e18),
+				common.HexToAddress("0xd03"): big.NewInt(0.96e18),
+				// Reward from AddressBook
+				common.HexToAddress("0xc01"): big.NewInt(1066666880000000000),
+				common.HexToAddress("0xc02"): big.NewInt(1219048106666666667),
+				common.HexToAddress("0xc04"): big.NewInt(853333333333333333),
+				// Reward from CL
+				common.HexToAddress("0xe01"): big.NewInt(213333120000000000),
+				common.HexToAddress("0xe02"): big.NewInt(487618559999999999),
+			},
+		}},
+		{"flex, 0 threshold, with CL", true, big.NewInt(0), kpfAddr, &reward.RewardSpec{
+			RewardSummary: reward.RewardSummary{
+				Minted:   mintingAmount,
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(3.5e16), // F/2
+			},
+			Proposer: big.NewInt(3.5e16 + 1),  // fee/2 + remainder
+			Stakers:  big.NewInt(3.84e18 - 1), // gM - remainder
+			KIF:      big.NewInt(2.40e18),
+			KEF:      big.NewInt(2.40e18),
+			KPF:      big.NewInt(0.96e18),
+			Rewards: map[common.Address]*big.Int{
+				// Proposer and funds
+				common.HexToAddress("0xfff"): big.NewInt(3.5e16 + 1),
+				common.HexToAddress("0xd01"): big.NewInt(2.40e18),
+				common.HexToAddress("0xd02"): big.NewInt(2.40e18),
+				common.HexToAddress("0xd03"): big.NewInt(0.96e18),
+				// Reward from AddressBook
+				common.HexToAddress("0xc01"): big.NewInt(1066666880000000000),
+				common.HexToAddress("0xc02"): big.NewInt(1066667093333333334),
+				common.HexToAddress("0xc04"): big.NewInt(1066666666666666666),
+				// Reward from CL
+				common.HexToAddress("0xe01"): big.NewInt(213333120000000000),
+				common.HexToAddress("0xe02"): big.NewInt(426666239999999999),
+			},
+		}},
+		{"flex, empty KPFAddr", true, big.NewInt(0), common.Address{}, &reward.RewardSpec{
+			RewardSummary: reward.RewardSummary{
+				Minted:   mintingAmount,
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(3.5e16), // F/2
+			},
+			Proposer: big.NewInt(0.96e18 + 3.5e16 + 1), // fee/2 + remainder + kpf
+			Stakers:  big.NewInt(3.84e18 - 1),          // gM - remainder
+			KIF:      big.NewInt(2.40e18),
+			KEF:      big.NewInt(2.40e18),
+			KPF:      big.NewInt(0), // kpf portion goes to proposer
+			Rewards: map[common.Address]*big.Int{
+				// Proposer and funds
+				common.HexToAddress("0xfff"): big.NewInt(0.96e18 + 3.5e16 + 1),
+				common.HexToAddress("0xd01"): big.NewInt(2.40e18),
+				common.HexToAddress("0xd02"): big.NewInt(2.40e18),
+				// Reward from AddressBook
+				common.HexToAddress("0xc01"): big.NewInt(1066666880000000000),
+				common.HexToAddress("0xc02"): big.NewInt(1066667093333333334),
+				common.HexToAddress("0xc04"): big.NewInt(1066666666666666666),
+				// Reward from CL
+				common.HexToAddress("0xe01"): big.NewInt(213333120000000000),
+				common.HexToAddress("0xe02"): big.NewInt(426666239999999999),
+			},
+		}},
+		{"flex, all below threshold, no staking reward", true, big.NewInt(9_000_000), kpfAddr, &reward.RewardSpec{
+			RewardSummary: reward.RewardSummary{
+				Minted:   mintingAmount,
+				TotalFee: big.NewInt(7e16),
+				BurntFee: big.NewInt(3.5e16), // F/2
+			},
+			Proposer: big.NewInt(3.84e18 + 3.5e16), // fee/2 + stakers
+			Stakers:  big.NewInt(0),                // no stakers were eligible
+			KIF:      big.NewInt(2.40e18),
+			KEF:      big.NewInt(2.40e18),
+			KPF:      big.NewInt(0.96e18),
+			Rewards: map[common.Address]*big.Int{
+				// Proposer and funds
+				common.HexToAddress("0xfff"): big.NewInt(3.84e18 + 3.5e16),
+				common.HexToAddress("0xd01"): big.NewInt(2.40e18),
+				common.HexToAddress("0xd02"): big.NewInt(2.40e18),
+				common.HexToAddress("0xd03"): big.NewInt(0.96e18),
+			},
+		}},
+	}
+	for _, tc := range testcases {
+		config.Rules.IsMagma = true
+		config.Rules.IsKore = true
+		config.Rules.IsPrague = true
+		config.Rules.IsOsaka = true
+		config.StakingRewardThreshold = tc.threshold
+
+		// Node3 will never be eligible, regardless of threshold because cnStaking (4m) < minStake (5m).
+		// ---------------------------------
+		// prague  threshold  Node1     Node2      Node3     Node4
+		// no      5mil       1         2          0         0
+		// no      3mil       2m+1      2m+2       0         2m
+		// no      0          5m+1      5m+2       0         5m
+		// yes     5mil       1m        2m         0         0
+		// yes     3mil       3m        4m         0         2m
+		// yes     0          6m        7m         0         5m
+		// no      9mil       0         0          0         0
+		si := makeTestStakingInfo([]uint64{5_000_001, 5_000_002, 4_000_003, 5_000_000}, tc.hasCL)
+		si.KPFAddr = tc.kpfAddr
+
+		spec, err := getDeferredRewardFull(config, totalFee, big.NewInt(0), si)
+		require.Nil(t, err, tc.desc)
+		assert.Equal(t, tc.expected, spec, tc.desc)
+		sanityCheckRewardSpec(t, spec, tc.desc)
+	}
+}
+
+func TestGetBurnAmountMagma(t *testing.T) {
+	assert.Equal(t, big.NewInt(1234), getBurnAmountMagma(big.NewInt(2468)))
+}
+
+func TestGetBurnAmountKore(t *testing.T) {
+	var (
+		mintingAmount  = big.NewInt(1000)
+		rewardRatio, _ = reward.NewRewardRatio("50/20/30")
+		kip82Ratio, _  = reward.NewRewardKip82Ratio("20/80")
+		config         = &reward.RewardConfig{MintingAmount: mintingAmount, RewardRatio: rewardRatio, Kip82Ratio: kip82Ratio}
+	)
+
+	testcases := []struct {
+		totalFee *big.Int
+		expected *big.Int
+	}{
+		// burnt = F/2 + min(F/2, gpM) where gpM (Proposer's minting reward) = 0.5*0.2*1000 = 100
+
+		// F/2 <= gpM, or F <= 200. burnt = F.
+		{big.NewInt(0), big.NewInt(0)},
+		{big.NewInt(100), big.NewInt(100)},
+		{big.NewInt(200), big.NewInt(200)},
+
+		// F/2 > gpM, or F > 200. burnt = F/2 + 100.
+		{big.NewInt(201), big.NewInt(200)}, // odd number case
+		{big.NewInt(300), big.NewInt(250)},
+	}
+	for _, tc := range testcases {
+		assert.Equal(t, tc.expected, getBurnAmountKore(config, tc.totalFee), tc.totalFee.String())
+	}
+}
+
+func TestAssignStakingRewards(t *testing.T) {
+	var (
+		min    = uint64(5_000_000)
+		config = &reward.RewardConfig{MinimumStake: big.NewInt(int64(min))}
+		reward = big.NewInt(1e18)
+	)
+	testcases := []struct {
+		desc              string
+		prague            bool
+		stakingAmounts    []uint64                    // in KAIA
+		expectedAlloc     map[common.Address]*big.Int // in kei
+		expectedRemainder *big.Int                    // in kei
+	}{
+		{
+			"no one eligible",
+			false,
+			[]uint64{0, 1, min - 1, min},
+			map[common.Address]*big.Int{},
+			big.NewInt(1e18),
+		},
+		{
+			"only one eligible",
+			false,
+			[]uint64{min + 1, min, min, min},
+			map[common.Address]*big.Int{
+				common.HexToAddress("0xc01"): big.NewInt(1e18),
+			},
+			big.NewInt(0),
+		},
+		{
+			"no remainder",
+			false,
+			[]uint64{min + 1, min + 2, min + 3, min + 4},
+			map[common.Address]*big.Int{
+				common.HexToAddress("0xc01"): big.NewInt(1e17),
+				common.HexToAddress("0xc02"): big.NewInt(2e17),
+				common.HexToAddress("0xc03"): big.NewInt(3e17),
+				common.HexToAddress("0xc04"): big.NewInt(4e17),
+			},
+			big.NewInt(0),
+		},
+		{
+			"remainder",
+			false,
+			[]uint64{min + 1000, min + 2000, min + 4000, 0},
+			map[common.Address]*big.Int{
+				common.HexToAddress("0xc01"): big.NewInt(142857142857142857),
+				common.HexToAddress("0xc02"): big.NewInt(285714285714285714),
+				common.HexToAddress("0xc03"): big.NewInt(571428571428571428),
+			},
+			big.NewInt(1),
+		},
+		// prague testcases
+		{
+			"prague: no one eligible",
+			true,
+			[]uint64{0, 1, min - 1, min},
+			map[common.Address]*big.Int{},
+			big.NewInt(1e18),
+		},
+		{
+			"prague: only one eligible",
+			true,
+			[]uint64{min, min - 1, min - 1, min - 1},
+			map[common.Address]*big.Int{
+				common.HexToAddress("0xc01"): big.NewInt(833333472222245371),
+				common.HexToAddress("0xe01"): big.NewInt(166666527777754629),
+			},
+			big.NewInt(0),
+		},
+		{
+			"prague: minStake is eligible if CL exists",
+			true,
+			[]uint64{min, min, min, min}, // Node4 has no CL
+			map[common.Address]*big.Int{
+				// AddressBook
+				common.HexToAddress("0xc01"): big.NewInt(138888912037040895),
+				common.HexToAddress("0xc02"): big.NewInt(238095306122468416),
+				common.HexToAddress("0xc03"): big.NewInt(312500117187543946),
+				// CL
+				common.HexToAddress("0xe01"): big.NewInt(27777754629625771),
+				common.HexToAddress("0xe02"): big.NewInt(95238027210864917),
+				common.HexToAddress("0xe03"): big.NewInt(187499882812456054),
+			},
+			big.NewInt(1),
+		},
+		{
+			"prague: no remainder",
+			true,
+			[]uint64{min + 1, min + 2, min + 3, min + 4_000_000}, // 6m, 7m, 8m, 9m
+			map[common.Address]*big.Int{
+				// AddressBook
+				common.HexToAddress("0xc01"): big.NewInt(83333350000000000),
+				common.HexToAddress("0xc02"): big.NewInt(142857200000000000),
+				common.HexToAddress("0xc03"): big.NewInt(187500112500000000),
+				common.HexToAddress("0xc04"): big.NewInt(4e17),
+				// CL
+				common.HexToAddress("0xe01"): big.NewInt(16666650000000000),
+				common.HexToAddress("0xe02"): big.NewInt(57142800000000000),
+				common.HexToAddress("0xe03"): big.NewInt(112499887500000000),
+			},
+			big.NewInt(0),
+		},
+		{
+			"prague: remainder",
+			true,
+			[]uint64{min + 1, min + 2, min + 3, 0}, // 6m, 7m, 8m, 0
+			map[common.Address]*big.Int{
+				// AddressBook
+				common.HexToAddress("0xc01"): big.NewInt(138888916666666667),
+				common.HexToAddress("0xc02"): big.NewInt(238095333333333334),
+				common.HexToAddress("0xc03"): big.NewInt(312500187500000000),
+				// CL
+				common.HexToAddress("0xe01"): big.NewInt(27777749999999999),
+				common.HexToAddress("0xe02"): big.NewInt(95237999999999999),
+				common.HexToAddress("0xe03"): big.NewInt(187499812500000000),
+			},
+			big.NewInt(1),
+		},
+	}
+	for _, tc := range testcases {
+		si := makeTestStakingInfo(tc.stakingAmounts, tc.prague)
+		config.Rules.IsPrague = tc.prague
+		alloc, remainder := assignStakingRewards(config, reward, si)
+
+		assert.Equal(t, tc.expectedAlloc, alloc, tc.desc)
+		assert.Equal(t, tc.expectedRemainder.String(), remainder.String(), tc.desc)
+	}
+}
+
+func TestSpecWithProposerAndFunds(t *testing.T) {
+	var (
+		zeroAddr   = common.Address{}
+		kifAddr    = common.HexToAddress("0xd01")
+		kefAddr    = common.HexToAddress("0xd02")
+		rewardbase = common.HexToAddress("0xfff")
+
+		proposer = int64(500)
+		kif      = int64(200)
+		kef      = int64(300)
+
+		config = &reward.RewardConfig{Rewardbase: rewardbase}
+	)
+
+	testcases := []struct {
+		kifAddr          common.Address
+		kefAddr          common.Address
+		expectedProposer *big.Int
+		expectedKIF      *big.Int
+		expectedKEF      *big.Int
+		expectedRewards  map[common.Address]*big.Int
+	}{
+		{zeroAddr, zeroAddr, big.NewInt(proposer + kif + kef), big.NewInt(0), big.NewInt(0), map[common.Address]*big.Int{
+			rewardbase: big.NewInt(proposer + kif + kef),
+		}},
+		{kifAddr, zeroAddr, big.NewInt(kef + proposer), big.NewInt(kif), big.NewInt(0), map[common.Address]*big.Int{
+			rewardbase: big.NewInt(proposer + kef),
+			kifAddr:    big.NewInt(kif),
+		}},
+		{zeroAddr, kefAddr, big.NewInt(proposer + kif), big.NewInt(0), big.NewInt(kef), map[common.Address]*big.Int{
+			rewardbase: big.NewInt(proposer + kif),
+			kefAddr:    big.NewInt(kef),
+		}},
+		{kifAddr, kefAddr, big.NewInt(proposer), big.NewInt(kif), big.NewInt(kef), map[common.Address]*big.Int{
+			rewardbase: big.NewInt(proposer),
+			kifAddr:    big.NewInt(kif),
+			kefAddr:    big.NewInt(kef),
+		}},
+		// KIF and KEF addresses are the same.
+		{kifAddr, kifAddr, big.NewInt(proposer), big.NewInt(kif), big.NewInt(kef), map[common.Address]*big.Int{
+			rewardbase: big.NewInt(proposer),
+			kifAddr:    big.NewInt(kif + kef),
+		}},
+	}
+	for i, tc := range testcases {
+		spec := reward.NewRewardSpec()
+		si := &staking.StakingInfo{KIFAddr: tc.kifAddr, KEFAddr: tc.kefAddr}
+		spec = specWithProposerAndFunds(spec, config, big.NewInt(proposer), big.NewInt(kif), big.NewInt(kef), si)
+
+		assert.Equal(t, tc.expectedKIF, spec.KIF, i)
+		assert.Equal(t, tc.expectedKEF, spec.KEF, i)
+		assert.Equal(t, tc.expectedProposer, spec.Proposer, i)
+		assert.Equal(t, tc.expectedRewards, spec.Rewards, i)
+	}
+}
+
+func TestSpecWithProposerAndFundsPrague(t *testing.T) {
+	var (
+		zeroAddr     = common.Address{}
+		kifAddr      = common.HexToAddress("0xd01")
+		kefAddr      = common.HexToAddress("0xd02")
+		rewardbase   = common.HexToAddress("0xfff")
+		clRewardbase = common.HexToAddress("0xffe")
+
+		proposer = int64(500)
+		kif      = int64(200)
+		kef      = int64(300)
+
+		sumThree       = big.NewInt(proposer + kif + kef)
+		sumProposerKif = big.NewInt(proposer + kif)
+		sumProposerKef = big.NewInt(proposer + kef)
+
+		config = &reward.RewardConfig{Rewardbase: rewardbase, Rules: params.Rules{IsPrague: true}}
+	)
+
+	testcases := []struct {
+		kifAddr          common.Address
+		kefAddr          common.Address
+		expectedProposer *big.Int
+		expectedKIF      *big.Int
+		expectedKEF      *big.Int
+		expectedRewards  map[common.Address]*big.Int
+	}{
+		{zeroAddr, zeroAddr, sumThree, big.NewInt(0), big.NewInt(0), map[common.Address]*big.Int{
+			rewardbase:   new(big.Int).Div(sumThree, big.NewInt(2)),
+			clRewardbase: new(big.Int).Div(sumThree, big.NewInt(2)),
+		}},
+		{kifAddr, zeroAddr, sumProposerKef, big.NewInt(kif), big.NewInt(0), map[common.Address]*big.Int{
+			rewardbase:   new(big.Int).Div(sumProposerKef, big.NewInt(2)),
+			clRewardbase: new(big.Int).Div(sumProposerKef, big.NewInt(2)),
+			kifAddr:      big.NewInt(kif),
+		}},
+		{zeroAddr, kefAddr, sumProposerKif, big.NewInt(0), big.NewInt(kef), map[common.Address]*big.Int{
+			rewardbase:   new(big.Int).Div(sumProposerKif, big.NewInt(2)),
+			clRewardbase: new(big.Int).Div(sumProposerKif, big.NewInt(2)),
+			kefAddr:      big.NewInt(kef),
+		}},
+		{kifAddr, kefAddr, big.NewInt(proposer), big.NewInt(kif), big.NewInt(kef), map[common.Address]*big.Int{
+			rewardbase:   new(big.Int).Div(big.NewInt(proposer), big.NewInt(2)),
+			clRewardbase: new(big.Int).Div(big.NewInt(proposer), big.NewInt(2)),
+			kifAddr:      big.NewInt(kif),
+			kefAddr:      big.NewInt(kef),
+		}},
+		// KIF and KEF addresses are the same.
+		{kifAddr, kifAddr, big.NewInt(proposer), big.NewInt(kif), big.NewInt(kef), map[common.Address]*big.Int{
+			rewardbase:   new(big.Int).Div(big.NewInt(proposer), big.NewInt(2)),
+			clRewardbase: new(big.Int).Div(big.NewInt(proposer), big.NewInt(2)),
+			kifAddr:      big.NewInt(kif + kef),
+		}},
+	}
+	for i, tc := range testcases {
+		spec := reward.NewRewardSpec()
+		si := &staking.StakingInfo{NodeIds: []common.Address{common.HexToAddress("0xa01")}, StakingContracts: []common.Address{common.HexToAddress("0xd01")}, RewardAddrs: []common.Address{rewardbase}, StakingAmounts: []uint64{1000}, KIFAddr: tc.kifAddr, KEFAddr: tc.kefAddr, CLStakingInfos: staking.CLStakingInfos{
+			&staking.CLStakingInfo{
+				CLNodeId:        common.HexToAddress("0xa01"),
+				CLPoolAddr:      clRewardbase,
+				CLStakingAmount: 1000,
+			},
+		}}
+		spec = specWithProposerAndFunds(spec, config, big.NewInt(proposer), big.NewInt(kif), big.NewInt(kef), si)
+
+		assert.Equal(t, tc.expectedKIF, spec.KIF, i)
+		assert.Equal(t, tc.expectedKEF, spec.KEF, i)
+		assert.Equal(t, tc.expectedProposer, spec.Proposer, i)
+		assert.Equal(t, tc.expectedRewards, spec.Rewards, i)
+	}
+}
+
+func sanityCheckRewardSpec(t *testing.T, spec *reward.RewardSpec, msg interface{}) {
+	sumSummary := new(big.Int).Add(spec.Minted, spec.TotalFee)
+	sumSummary.Sub(sumSummary, spec.BurntFee)
+	assert.True(t, spec.Minted.Sign() >= 0, msg)
+	assert.True(t, spec.TotalFee.Sign() >= 0, msg)
+	assert.True(t, spec.BurntFee.Sign() >= 0, msg)
+
+	sumParts := new(big.Int).Add(spec.Proposer, spec.Stakers)
+	sumParts.Add(sumParts, spec.KIF)
+	sumParts.Add(sumParts, spec.KEF)
+	sumParts.Add(sumParts, spec.KPF)
+	assert.True(t, spec.Proposer.Sign() >= 0, msg)
+	assert.True(t, spec.Stakers.Sign() >= 0, msg)
+	assert.True(t, spec.KIF.Sign() >= 0, msg)
+	assert.True(t, spec.KEF.Sign() >= 0, msg)
+	assert.True(t, spec.KPF.Sign() >= 0, msg)
+
+	sumRewards := new(big.Int)
+	for _, amount := range spec.Rewards {
+		sumRewards.Add(sumRewards, amount)
+		assert.True(t, amount.Sign() >= 0, msg)
+	}
+
+	assert.Equal(t, sumSummary, sumParts, msg)
+	assert.Equal(t, sumSummary, sumRewards, msg)
+}
+
+// TestGetBlobFee tests the getBlobFee helper for nil, zero, and one-blob cases.
+func TestGetBlobFee(t *testing.T) {
+	// nil BlobGasUsed → zero
+	assert.Equal(t, big.NewInt(0), getBlobFee(&types.Header{BaseFee: big.NewInt(27e9)}), "nil BlobGasUsed")
+
+	// zero BlobGasUsed → zero
+	zero := uint64(0)
+	assert.Equal(t, big.NewInt(0), getBlobFee(&types.Header{BlobGasUsed: &zero, BaseFee: big.NewInt(27e9)}), "zero BlobGasUsed")
+
+	// nil BaseFee → CalcBlobFee returns nil → zero
+	blobGasUsed := uint64(params.BlobTxBlobGasPerBlob)
+	assert.Equal(t, big.NewInt(0), getBlobFee(&types.Header{BlobGasUsed: &blobGasUsed}), "nil BaseFee")
+
+	// one blob at baseFee=27e9: 131072 * (27e9 * 8) = 28311552000000000
+	assert.Equal(t, big.NewInt(28311552000000000), getBlobFee(&types.Header{BlobGasUsed: &blobGasUsed, BaseFee: big.NewInt(27e9)}), "one blob")
+}
+
+// TestGetRewardSummary_NonDeferredExceptionPinned pins the deliberate exception documented in README.md:
+// getRewardSummary does not consult DeferredTxFee, so for a non-deferred chain before Permissionless it
+// still reports the deferred-mode burn (F/2) although the state credited the whole fee (#1097). Changing this
+// requires recomputing the persisted kaiax/supply checkpoints; see the follow-up of #1097.
+func TestGetRewardSummary_NonDeferredExceptionPinned(t *testing.T) {
+	execFee := big.NewInt(7e16)
+	config := &reward.RewardConfig{IsSimple: true, DeferredTxFee: false, Rules: params.Rules{IsMagma: true}, MintingAmount: big.NewInt(0)}
+	summary := getRewardSummary(config, execFee, big.NewInt(0))
+	assert.Zero(t, big.NewInt(3.5e16).Cmp(summary.BurntFee), "non-deferred before Permissionless still reports F/2: got %s", summary.BurntFee)
+}
+
+// TestGetRewardSummary_BlobFee verifies that blobFee is added to both TotalFee and BurntFee
+// without affecting the execution-fee burn ratio.
+func TestGetRewardSummary_BlobFee(t *testing.T) {
+	var (
+		mintingAmount  = big.NewInt(6.4e18)
+		rewardRatio, _ = reward.NewRewardRatio("50/20/30")
+		kip82Ratio, _  = reward.NewRewardKip82Ratio("20/80")
+		config         = &reward.RewardConfig{
+			MintingAmount: mintingAmount,
+			RewardRatio:   rewardRatio,
+			Kip82Ratio:    kip82Ratio,
+		}
+		execFee = big.NewInt(7e16)
+		blobFee = big.NewInt(28311552000000000) // one blob at baseFee=27e9
+	)
+
+	testcases := []struct {
+		desc             string
+		magma, kore      bool
+		expectedBurntFee *big.Int
+	}{
+		// pre-Magma: exec burn = 0, blob burn = blobFee
+		{"pre-magma", false, false, blobFee},
+		// Magma: exec burn = F/2 = 3.5e16, blob burn = blobFee
+		{"magma", true, false, new(big.Int).Add(big.NewInt(3.5e16), blobFee)},
+		// Kore low traffic: exec burn = F = 7e16, blob burn = blobFee
+		{"kore", true, true, new(big.Int).Add(execFee, blobFee)},
+	}
+	for _, tc := range testcases {
+		config.Rules.IsMagma = tc.magma
+		config.Rules.IsKore = tc.kore
+		spec := getRewardSummary(config, execFee, blobFee)
+
+		assert.Equal(t, new(big.Int).Add(execFee, blobFee), spec.TotalFee, tc.desc+" TotalFee")
+		assert.Equal(t, tc.expectedBurntFee, spec.BurntFee, tc.desc+" BurntFee")
+	}
+}
+
+// TestGetBlockReward_BlobFee tests that GetBlockReward correctly reflects blob fees
+// in TotalFee and BurntFee for both deferred and non-deferred modes.
+func TestGetBlockReward_BlobFee(t *testing.T) {
+	// blobFee = BlobTxBlobGasPerBlob * baseFee * BlobBaseFeeMultiplier = 131072 * 27e9 * 8
+	blobFee := big.NewInt(28311552000000000)
+	execFee := big.NewInt(0.0376e18)
+
+	testcases := []struct {
+		desc             string
+		deferred         bool
+		permissionless   bool
+		expectedTotalFee *big.Int
+		expectedBurntFee *big.Int
+	}{
+		{
+			// Deferred: specWithNonDeferredFee is a no-op; values come from getDeferredReward.
+			"full deferred", true, false,
+			new(big.Int).Add(execFee, blobFee),
+			new(big.Int).Add(execFee, blobFee),
+		},
+		{
+			// Non-deferred before Permissionless: specWithNonDeferredFee adds execFee+blobFee to TotalFee,
+			// only blobFee to BurntFee (the exec fee burn starts at Permissionless, #1097), and F to Proposer.
+			"full non-deferred before permissionless", false, false,
+			new(big.Int).Add(execFee, blobFee),
+			new(big.Int).Set(blobFee), // blobFee only
+		},
+		{
+			// Non-deferred since Permissionless: specWithNonDeferredFee adds execFee+blobFee to TotalFee,
+			// getBurnAmountMagma(execFee)+blobFee to BurntFee, and F/2 to Proposer.
+			"full non-deferred since permissionless", false, true,
+			new(big.Int).Add(execFee, blobFee),
+			new(big.Int).Add(big.NewInt(0.0188e18), blobFee), // F/2 + blobFee
+		},
+	}
+	for _, tc := range testcases {
+		header, txs, receipts := makeTestOsakaBlock(61)
+		r := makeTestRewardModuleWithConfig(t, rewardModuleTestConfig{
+			Deferred:         tc.deferred,
+			IsPermissionless: tc.permissionless,
+			Header:           header,
+			Txs:              txs,
+			Receipts:         receipts,
+		})
+
+		spec, err := r.GetBlockReward(header.Number.Uint64())
+		require.Nil(t, err, tc.desc)
+		assert.Equal(t, tc.expectedTotalFee, spec.TotalFee, tc.desc+" TotalFee")
+		assert.Equal(t, tc.expectedBurntFee, spec.BurntFee, tc.desc+" BurntFee")
+		sanityCheckRewardSpec(t, spec, tc.desc)
+	}
+}
+
+// TestGetDeferredReward_BlobFee tests that GetDeferredReward correctly reflects blob fees
+// in deferred mode, and correctly shows zero fees in non-deferred mode (where both exec and
+// blob fees are processed during state transition, not at finalization).
+func TestGetDeferredReward_BlobFee(t *testing.T) {
+	// blobFee = BlobTxBlobGasPerBlob * baseFee * BlobBaseFeeMultiplier = 131072 * 27e9 * 8
+	blobFee := big.NewInt(28311552000000000)
+	execFee := big.NewInt(0.0376e18)
+
+	testcases := []struct {
+		desc             string
+		deferred         bool
+		expectedTotalFee *big.Int
+		expectedBurntFee *big.Int
+	}{
+		{
+			// Deferred: all of execFee is burned (Kore low traffic) plus blobFee.
+			"full deferred", true,
+			new(big.Int).Add(execFee, blobFee),
+			new(big.Int).Add(execFee, blobFee),
+		},
+		{
+			// Non-deferred: exec and blob fees are both processed during state transition.
+			// GetDeferredReward represents what happens at finalization only (minting reward).
+			"full non-deferred", false,
+			big.NewInt(0),
+			big.NewInt(0),
+		},
+	}
+	for _, tc := range testcases {
+		header, txs, receipts := makeTestOsakaBlock(61)
+		r := makeTestRewardModule(t, false, tc.deferred, false, header, txs, receipts)
+
+		spec, err := r.GetDeferredReward(header, txs, receipts)
+		require.Nil(t, err, tc.desc)
+		assert.Equal(t, tc.expectedTotalFee, spec.TotalFee, tc.desc+" TotalFee")
+		assert.Equal(t, tc.expectedBurntFee, spec.BurntFee, tc.desc+" BurntFee")
+	}
+}
+
+// TestGetDeferredRewardSimple_BlobFee verifies that in deferred mode blobFee is added to TotalFee
+// and BurntFee, while in non-deferred mode it is left for specWithNonDeferredFee.
+func TestGetDeferredRewardSimple_BlobFee(t *testing.T) {
+	var (
+		mintingAmount = big.NewInt(6.4e18)
+		config        = &reward.RewardConfig{
+			Rewardbase:    common.HexToAddress("0xfff"),
+			MintingAmount: mintingAmount,
+			Rules:         params.Rules{IsMagma: true},
+		}
+		execFee = big.NewInt(7e16)
+		blobFee = big.NewInt(28311552000000000) // one blob at baseFee=27e9
+	)
+
+	// Deferred mode: blobFee is included in TotalFee and BurntFee.
+	// BurntFee = getBurnAmountMagma(execFee) + blobFee = 3.5e16 + blobFee
+	config.DeferredTxFee = true
+	spec, err := getDeferredRewardSimple(config, execFee, blobFee)
+	require.Nil(t, err)
+	assert.Equal(t, new(big.Int).Add(execFee, blobFee), spec.TotalFee, "deferred TotalFee")
+	assert.Equal(t, new(big.Int).Add(big.NewInt(3.5e16), blobFee), spec.BurntFee, "deferred BurntFee")
+	sanityCheckRewardSpec(t, spec, "simple deferred with blob")
+
+	// Non-deferred mode: both exec and blob fees are processed during state transition, not at
+	// finalization. GetDeferredReward reports neither; specWithNonDeferredFee completes the
+	// picture for GetBlockReward only.
+	config.DeferredTxFee = false
+	spec, err = getDeferredRewardSimple(config, execFee, blobFee)
+	require.Nil(t, err)
+	assert.Equal(t, big.NewInt(0), spec.TotalFee, "non-deferred TotalFee")
+	assert.Equal(t, big.NewInt(0), spec.BurntFee, "non-deferred BurntFee")
+	sanityCheckRewardSpec(t, spec, "simple non-deferred with blob")
+}
+
+// TestGetDeferredRewardFull_BlobFee verifies blobFee handling in the Kore and Flex paths,
+// and confirms it is zeroed in non-deferred mode.
+func TestGetDeferredRewardFull_BlobFee(t *testing.T) {
+	var (
+		mintingAmount  = big.NewInt(6.4e18)
+		rewardRatio, _ = reward.NewRewardRatio("50/20/30")
+		kip82Ratio, _  = reward.NewRewardKip82Ratio("20/80")
+		config         = &reward.RewardConfig{
+			DeferredTxFee: true,
+			Rewardbase:    common.HexToAddress("0xfff"),
+			MintingAmount: mintingAmount,
+			MinimumStake:  big.NewInt(5_000_000),
+			RewardRatio:   rewardRatio,
+			Kip82Ratio:    kip82Ratio,
+		}
+		execFee = big.NewInt(7e16)              // low traffic
+		blobFee = big.NewInt(28311552000000000) // one blob at baseFee=27e9
+		si      = makeTestStakingInfo([]uint64{5_000_001, 5_000_002, 5_000_003, 5_000_000}, false)
+	)
+
+	// Kore deferred: TotalFee and BurntFee both include blobFee.
+	// Kore low traffic: burntKore(execFee) = execFee (all burned), so BurntFee = execFee + blobFee.
+	// Reward distribution (proposer/stakers) is identical to the zero-blob case.
+	config.Rules = params.Rules{IsMagma: true, IsKore: true}
+	spec, err := getDeferredRewardFull(config, execFee, blobFee, si)
+	require.Nil(t, err, "kore deferred")
+	assert.Equal(t, new(big.Int).Add(execFee, blobFee), spec.TotalFee, "kore deferred TotalFee")
+	assert.Equal(t, new(big.Int).Add(execFee, blobFee), spec.BurntFee, "kore deferred BurntFee")
+	assert.Equal(t, big.NewInt(0.64e18+1), spec.Proposer, "kore deferred Proposer unchanged")
+	sanityCheckRewardSpec(t, spec, "kore deferred with blob")
+
+	// Kore non-deferred: both exec and blob fees are processed during state transition, not at
+	// finalization. GetDeferredReward reports neither; specWithNonDeferredFee completes the
+	// picture for GetBlockReward only.
+	config.DeferredTxFee = false
+	spec, err = getDeferredRewardFull(config, execFee, blobFee, si)
+	require.Nil(t, err, "kore non-deferred")
+	assert.Equal(t, big.NewInt(0), spec.TotalFee, "kore non-deferred TotalFee")
+	assert.Equal(t, big.NewInt(0), spec.BurntFee, "kore non-deferred BurntFee")
+	sanityCheckRewardSpec(t, spec, "kore non-deferred with blob")
+
+	// Flex (Osaka + UseFlexReward) deferred: same TotalFee/BurntFee pattern as Kore.
+	siPrague := makeTestStakingInfo([]uint64{5_000_001, 5_000_002, 5_000_003, 5_000_000}, true)
+	config.DeferredTxFee = true
+	config.UseFlexReward = true
+	config.StakingRewardThreshold = big.NewInt(5_000_000)
+	config.Rules = params.Rules{IsMagma: true, IsKore: true, IsPrague: true, IsOsaka: true}
+	spec, err = getDeferredRewardFull(config, execFee, blobFee, siPrague)
+	require.Nil(t, err, "flex deferred")
+	assert.Equal(t, new(big.Int).Add(execFee, blobFee), spec.TotalFee, "flex deferred TotalFee")
+	assert.Equal(t, new(big.Int).Add(execFee, blobFee), spec.BurntFee, "flex deferred BurntFee")
+	sanityCheckRewardSpec(t, spec, "flex deferred with blob")
+}
+
+func newRewardDistributionTestContext(t *testing.T, config *params.ChainConfig, mintingByBlock map[uint64]uint64) (*state.StateDB, common.Address, *RewardModule) {
+	config = config.Copy()
+	config.SetDefaults()
+
+	key, err := crypto.GenerateKey()
+	require.NoError(t, err)
+	addr := crypto.PubkeyToAddress(key.PublicKey)
+	if config.Governance != nil && config.Governance.GovernanceMode == "single" {
+		config.Governance.GoverningNode = addr
+	}
+
+	dbm := database.NewMemoryDBManager()
+	sealer := faker.NewFaker()
+
+	genesis := blockchain.DefaultTestGenesisBlock()
+	genesis.Config = config
+	genesis.MustCommit(dbm)
+
+	chain, err := blockchain.NewBlockChain(dbm, nil, genesis.Config, sealer, vm.Config{})
+	require.NoError(t, err)
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	stakingInfo := &staking.StakingInfo{SourceBlockNum: 0}
+	rewardKey, err := crypto.GenerateKey()
+	require.NoError(t, err)
+	stakingInfo.NodeIds = []common.Address{addr}
+	stakingInfo.StakingContracts = []common.Address{addr}
+	stakingInfo.RewardAddrs = []common.Address{crypto.PubkeyToAddress(rewardKey.PublicKey)}
+	stakingInfo.StakingAmounts = []uint64{0}
+
+	mStaking := staking_mock.NewMockStakingModule(ctrl)
+	mStaking.EXPECT().GetStakingInfo(gomock.Any()).Return(stakingInfo, nil).AnyTimes()
+
+	mValset := valset_mock.NewMockValsetModule(ctrl)
+	mGov := gov_mock.NewMockGovModule(ctrl)
+
+	baseParamSet := *gov.GetDefaultGovernanceParamSet()
+	for name, param := range gov.Params {
+		val, err := param.ChainConfigValue(config)
+		require.NoError(t, err)
+		require.NoError(t, baseParamSet.Set(name, val))
+	}
+	mGov.EXPECT().GetParamSet(gomock.Any()).DoAndReturn(func(blockNum uint64) gov.ParamSet {
+		ps := baseParamSet
+		mintingAmount := mintingByBlock[blockNum]
+		if mintingAmount == 0 {
+			mintingAmount = mintingByBlock[0]
+		}
+		ps.MintingAmount = new(big.Int).SetUint64(mintingAmount)
+		return ps
+	}).AnyTimes()
+
+	mReward := NewRewardModule()
+	require.NoError(t, mReward.Init(&InitOpts{
+		ChainConfig:   chain.Config(),
+		Chain:         chain,
+		GovModule:     mGov,
+		StakingModule: mStaking,
+		ValsetModule:  mValset,
+	}))
+
+	stateDB, err := chain.StateAt(chain.Genesis().Root())
+	require.NoError(t, err)
+
+	t.Cleanup(chain.Stop)
+	return stateDB, addr, mReward
+}
+
+func TestRewardDistribution(t *testing.T) {
+	type expected = map[int]uint64
+	type testcase struct {
+		length         int
+		mintingByBlock map[uint64]uint64
+		expected       expected
+	}
+
+	cfg := params.TestKaiaConfig("magma")
+	cfg.Istanbul.Epoch = 3
+	cfg.Governance.Reward.MintingAmount = new(big.Int).SetUint64(1)
+	cfg.KoreCompatibleBlock = new(big.Int).SetUint64(9)
+
+	testcases := []testcase{
+		{
+			length: 12,
+			mintingByBlock: map[uint64]uint64{
+				0: 1,
+				1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1,
+				7: 2, 8: 2,
+				9: 3, 10: 3, 11: 3, 12: 3, 13: 3,
+			},
+			expected: map[int]uint64{
+				1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6,
+				7: 8, 8: 10, 9: 13, 10: 16, 11: 19, 12: 22, 13: 25,
+			},
+		},
+	}
+
+	for _, tc := range testcases {
+		stateDB, rewardbase, mReward := newRewardDistributionTestContext(t, cfg, tc.mintingByBlock)
+		for blockNum := 1; blockNum <= tc.length+1; blockNum++ {
+			header := &types.Header{
+				Number:     new(big.Int).SetUint64(uint64(blockNum)),
+				GasUsed:    0,
+				BaseFee:    big.NewInt(0),
+				Rewardbase: rewardbase,
+				BlockScore: params.DefaultBlockScore,
+				Root:       common.Hash{1}, // a processed block; focus on distribution amount
+			}
+
+			err := mReward.FinalizeState(header, stateDB, nil, nil)
+			require.NoError(t, err)
+
+			bal := stateDB.GetBalance(rewardbase)
+			assert.Equal(t, tc.expected[blockNum], bal.Uint64(), "wrong at block %d", blockNum)
+		}
+	}
+}
